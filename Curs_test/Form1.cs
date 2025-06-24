@@ -1,13 +1,14 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.IO;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using System.Net;
-using System.Text;
-using System.IO;
-using System.Text.Json;
 
 namespace Curs_test
 {
@@ -32,6 +33,19 @@ namespace Curs_test
             SetupPieces();
             UpdateStatusLabels();
             CenterBoard();
+        }
+
+        private NetworkStream stream;
+        private bool isWhite;
+
+        public Form1(NetworkStream stream, bool isWhite)
+        {
+            this.stream = stream;
+            this.isWhite = isWhite;
+            InitializeComponent();
+            // остальные init методы...
+            Task.Run(ListenForOpponentMoves);
+            if (!isWhite) isWhiteTurn = false; // если чёрный, ходит второй
         }
 
         private void InitializeForm()
@@ -203,6 +217,24 @@ namespace Curs_test
                     cells[row, col] = btn;
                     tableLayoutPanel1.Controls.Add(btn, col, row);
                 }
+            }
+        }
+
+        private async void ListenForOpponentMoves()
+        {
+            var reader = new StreamReader(stream, Encoding.UTF8);
+            while (true)
+            {
+                string line = await reader.ReadLineAsync();
+                if (line == null) break;
+                var parts = line.Split(',');
+                Point from = new Point(int.Parse(parts[0]), int.Parse(parts[1]));
+                Point to = new Point(int.Parse(parts[2]), int.Parse(parts[3]));
+                this.Invoke(() => {
+                    ExecuteMove(from, to);
+                    isWhiteTurn = !isWhiteTurn;
+                    UpdateStatusLabels();
+                });
             }
         }
 
