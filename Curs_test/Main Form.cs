@@ -2,7 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
-using System.Data;
+using System.DirectoryServices;
 using System.Drawing;
 using System.Linq;
 using System.Net.Sockets;
@@ -23,9 +23,7 @@ namespace ChessClient
         GameStart,
         IsReady,
         MovingInGame,
-        Win,
-        ChatMessage,
-        LobbyUpdate
+        Win
     }
 
     class Message
@@ -37,32 +35,98 @@ namespace ChessClient
     public class Lobby
     {
         public int id { get; set; }
+        public string name { get; set; }
+        public bool isPassword { get; set; }
+        public string password { get; set; }
+        public int hostID { get; set; }
+        public int usersID { get; set; }
+        public bool final { get; set; }
+        public ChessField chessField { get; set; }
+    }
+
+    public class LobbyEntity
+    {
+        public int Id { get; set; }
         public string Name { get; set; }
         public bool IsPassword { get; set; }
         public string Password { get; set; }
         public int HostID { get; set; }
         public int UsersID { get; set; }
+        public bool Final { get; set; }
+        public string ChessFieldJson { get; set; }
     }
-}
 
-namespace ChessClient
-{
+    public enum team
+    {
+        white,
+        black
+    }
+    public class ChessField
+    {
+        public List<List<ChessPiece>> Board { get; set; }
+        public PlayerTeam CurrentPlayer { get; set; }
+        public bool IsGameOver { get; set; }
+        public PlayerTeam? Winner { get; set; }
+
+        public ChessField()
+        {
+            Board = new List<List<ChessPiece>>();
+            for (int i = 0; i < 8; i++)
+            {
+                var row = new List<ChessPiece>();
+                for (int j = 0; j < 8; j++)
+                    row.Add(new ChessPiece());
+                Board.Add(row);
+            }
+            CurrentPlayer = PlayerTeam.White;
+            IsGameOver = false;
+            Winner = null;
+        }
+
+        public ChessField(List<List<ChessPiece>> board, PlayerTeam currentPlayer)
+        {
+            Board = board;
+            CurrentPlayer = currentPlayer;
+            IsGameOver = false;
+            Winner = null;
+        }
+
+    }
+
+    public abstract class Chessman
+    {
+        protected int x, y;
+        protected team team;
+    }
+
+    public class Move
+    {
+        public int UserId { get; set; }
+        public int LobbyId { get; set; }
+        public ChessField chessField { get; set; }
+    }
+
     public partial class Form2 : Form
     {
-        private TcpClient client;
-        private NetworkStream stream;
-        private string playerName;
-        private List<Lobby> lobbies = new List<Lobby>();
-        private bool isInGame = false;
-        private bool isHost = false;
+        private readonly HttpClient http = new HttpClient();
+        private const string baseUrl = "https://serverforchess-production.up.railway.app/";
+
+        private string playerName = "";
+        private int playerId = -1;
         private int currentLobbyId = -1;
+        private int currentLobbyPlayerCount = 1;
+        private CancellationTokenSource pollCts;
+        private bool isHost = false;
+        private List<Lobby> lobbies = new List<Lobby>();
 
         public Form2()
         {
-            CreateAllControls();
             InitializeComponent();
+            http.BaseAddress = new Uri(baseUrl);
+            CreateAllControls();
             ShowLoginControls();
         }
+
         // LOGIN
         private Label lblTitle;
         private Label lblPlayerName;
@@ -87,6 +151,7 @@ namespace ChessClient
         private RichTextBox richTextBox1;
         private Button btnBackToLobby;
         private Button btnStart;
+        private Label lblStatus;
 
         private void CreateAllControls()
         {
@@ -117,8 +182,6 @@ namespace ChessClient
             btnLogin.Click += new EventHandler(this.btnLogin_Click);
             this.Controls.Add(btnLogin);
 
-
-
             // LOBBY
             lblWelcome = new Label();
             lblWelcome.Text = "Добро пожаловать!";
@@ -132,28 +195,53 @@ namespace ChessClient
             dataGridView1.Location = new Point(10, 50);
             dataGridView1.Size = new Size(500, 300);
             dataGridView1.AutoGenerateColumns = false;
+            dataGridView1.AllowUserToAddRows = false;
             dataGridView1.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
             dataGridView1.MultiSelect = false;
             dataGridView1.Visible = false;
-
+            dataGridView1.ReadOnly = true;
+            dataGridView1.Columns.Clear();
             dataGridView1.Columns.Add(new DataGridViewTextBoxColumn
             {
                 DataPropertyName = "Name",
                 HeaderText = "Название лобби",
+                ReadOnly = true,
                 Width = 200
             });
-            dataGridView1.Columns.Add(new DataGridViewCheckBoxColumn
+            /*dataGridView1.Columns.Add(new DataGridViewCheckBoxColumn
             {
                 DataPropertyName = "IsPassword",
                 HeaderText = "Пароль",
+                ReadOnly = true,
                 Width = 80
-            });
+            });*/
+            var passwordColumn = new DataGridViewTextBoxColumn
+            {
+                HeaderText = "Пароль",
+                ReadOnly = true,
+                Width = 80
+            };
+            passwordColumn.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+            dataGridView1.Columns.Add(passwordColumn);
             dataGridView1.Columns.Add(new DataGridViewTextBoxColumn
             {
                 DataPropertyName = "id",
                 HeaderText = "ID",
+                ReadOnly = true,
                 Width = 50
             });
+            dataGridView1.CellFormatting += (sender, e) =>
+            {
+                if (e.ColumnIndex == 1) // Колонка пароля
+                {
+                    var lobby = dataGridView1.Rows[e.RowIndex].DataBoundItem as Lobby;
+                    if (lobby != null)
+                    {
+                        e.Value = lobby.isPassword ? "Да" : "Нет";
+                        e.FormattingApplied = true;
+                    }
+                }
+            };
             this.Controls.Add(dataGridView1);
 
             btnRefresh = new Button();
@@ -314,6 +402,8 @@ namespace ChessClient
             richTextBox1.Visible = true;
             btnBackToLobby.Visible = true;
             btnStart.Visible = true;
+            btnStart.Enabled = true;
+            btnStart.Text = "Старт";
         }
 
         private void HideAllControls()
@@ -324,51 +414,33 @@ namespace ChessClient
             }
         }
 
-        private int currentLobbyPlayerCount = 1;
-
-        private void UpdateStartButtonState()
-        {
-            btnStart.Text = $"{currentLobbyPlayerCount}/2";
-            btnStart.Enabled = currentLobbyPlayerCount >= 2;
-        }
-
         private async void btnLogin_Click(object sender, EventArgs e)
         {
             if (string.IsNullOrWhiteSpace(txtPlayerName.Text))
             {
-                MessageBox.Show("Пожалуйста, введите ваше имя!", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Введите имя", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
             playerName = txtPlayerName.Text.Trim();
+            var content = new StringContent(JsonSerializer.Serialize(playerName), Encoding.UTF8, "application/json");
 
             try
             {
-                await ConnectToServer();
-                lblWelcome.Text = $"Добро пожаловать, {playerName}!";
+                var resp = await http.PostAsync("api/Name", content);
+                resp.EnsureSuccessStatusCode();
+
+                var body = await resp.Content.ReadAsStringAsync();
+                playerId = int.Parse(body);
+
+                lblWelcome.Text = $"Добро пожаловать, {playerName}! (ID: {playerId})";
                 ShowLobbyControls();
                 await RefreshLobbies();
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Ошибка подключения к серверу: {ex.Message}", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show("Не удалось войти: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
-        }
-
-        private async Task ConnectToServer()
-        {
-            client = new TcpClient();
-            await client.ConnectAsync("127.0.0.1", 5050);
-            stream = client.GetStream();
-
-            var nameMessage = new Message
-            {
-                messageType = MessageType.GetName,
-                data = Encoding.UTF8.GetBytes(playerName)
-            };
-            SendMessage(nameMessage);
-
-            Task.Run(ListenForMessages);
         }
 
         private async void btnRefresh_Click(object sender, EventArgs e)
@@ -380,16 +452,48 @@ namespace ChessClient
         {
             try
             {
-                var message = new Message
+                var resp = await http.GetAsync("api/lobby");
+                resp.EnsureSuccessStatusCode();
+
+                var json = await resp.Content.ReadAsStringAsync();
+                var lobbyEntities = JsonSerializer.Deserialize<List<LobbyEntity>>(json) ?? new List<LobbyEntity>();
+                lobbies = lobbyEntities.Select(e => new Lobby
                 {
-                    messageType = MessageType.GetLobbys,
-                    data = new byte[0]
-                };
-                SendMessage(message);
+                    id = e.Id,
+                    name = e.Name,
+                    isPassword = e.IsPassword,
+                    password = e.Password,
+                    hostID = e.HostID,
+                    usersID = e.UsersID,
+                    final = e.Final,
+                    chessField = null
+                }).ToList();
+                // Принудительное обновление DataGridView
+                dataGridView1.SuspendLayout();
+                dataGridView1.DataSource = null;
+                dataGridView1.DataSource = lobbies;
+                dataGridView1.Refresh();
+                dataGridView1.ResumeLayout();
+
+                // Дополнительно вызываем принудительное обновление
+                ForceRefreshDataGridView();
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Ошибка при обновлении лобби: {ex.Message}", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show("Ошибка загрузки лобби: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void ForceRefreshDataGridView()
+        {
+            if (dataGridView1.DataSource != null)
+            {
+                dataGridView1.SuspendLayout();
+                var currentSource = dataGridView1.DataSource;
+                dataGridView1.DataSource = null;
+                dataGridView1.DataSource = currentSource;
+                dataGridView1.Refresh();
+                dataGridView1.ResumeLayout();
             }
         }
 
@@ -401,42 +505,65 @@ namespace ChessClient
                 ShowCreateLobbyControls();
         }
 
-        private void btnCreateGame_Click(object sender, EventArgs e)
+        private async void btnCreateGame_Click(object sender, EventArgs e)
         {
             if (string.IsNullOrWhiteSpace(txtLobbyName.Text))
             {
-                MessageBox.Show("Введите название лобби!", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Введите название", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
-            var lobby = new Lobby
+            var lobby = new LobbyEntity
             {
-                Name = txtLobbyName.Text,
+                Name = txtLobbyName.Text.Trim(),
+                HostID = playerId,
                 IsPassword = checkBox1.Checked,
-                Password = checkBox1.Checked ? txtPassword.Text : ""
+                Password = checkBox1.Checked ? txtPassword.Text : "",
+                ChessFieldJson = "{}"
             };
 
-            var message = new Message
+            try
             {
-                messageType = MessageType.StartNewGame,
-                data = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(lobby))
-            };
+                var content = new StringContent(JsonSerializer.Serialize(lobby), Encoding.UTF8, "application/json");
+                var resp = await http.PostAsync("api/startNewGame", content);
+                resp.EnsureSuccessStatusCode();
 
-            SendMessage(message);
-
-            isHost = true;
-
-            HideCreateLobbyControls();
-            ShowGameControls();
-            lblGameStatus.Text = "Ожидание второго игрока...";
-            richTextBox1.AppendText($"Лобби '{lobby.Name}' создано. Ожидание подключения второго игрока...\n");
-
-            SendMessage(new Message
+                var idStr = await resp.Content.ReadAsStringAsync();
+                currentLobbyId = int.Parse(idStr);
+                isHost = true;
+                await ConnectToOwnLobbyAsHost(currentLobbyId);
+                HideCreateLobbyControls();
+                txtLobbyName.Clear();
+                txtPassword.Clear();
+                checkBox1.Checked = false;
+                ShowGameControls();
+                lblGameStatus.Text = "Лобби создано, можно начинать игру…";
+                richTextBox1.AppendText($"Лобби '{lobby.Name}' (ID:{currentLobbyId}) создано.\n");
+                if (lobby.IsPassword)
+                {
+                    richTextBox1.AppendText("Лобби защищено паролем.\n");
+                }
+                richTextBox1.AppendText("Нажмите 'Старт' для начала игры.\n");
+            }
+            catch (Exception ex)
             {
-                messageType = MessageType.LobbyUpdate,
-                data = Encoding.UTF8.GetBytes($"{playerName} создал лобби '{lobby.Name}'.")
-            });
+                MessageBox.Show("Не удалось создать лобби: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
 
+        private async Task ConnectToOwnLobbyAsHost(int lobbyId)
+        {
+            try
+            {
+                var content = new StringContent(JsonSerializer.Serialize(new[] { playerId, lobbyId }), Encoding.UTF8, "application/json");
+                var resp = await http.PostAsync("api/connectiontogame", content);
+                resp.EnsureSuccessStatusCode();
+                richTextBox1.AppendText("Вы как хост тоже подключились к лобби.\n");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Ошибка автоподключения хоста: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
         private void btnCancelCreate_Click(object sender, EventArgs e)
@@ -449,52 +576,147 @@ namespace ChessClient
             txtPassword.Enabled = checkBox1.Checked;
         }
 
-        private void btnJoinLobby_Click(object sender, EventArgs e)
+        private async void btnJoinLobby_Click(object sender, EventArgs e)
         {
-            if (dataGridView1.SelectedRows.Count == 0)
+            if (dataGridView1.SelectedRows.Count == 0 || dataGridView1.SelectedRows[0].DataBoundItem == null)
             {
-                MessageBox.Show("Выберите лобби для подключения!", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Выберите лобби", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
-            var selectedLobby = dataGridView1.SelectedRows[0].DataBoundItem as Lobby;
-            if (selectedLobby == null) return;
-
-            if (selectedLobby.UsersID >= 2)
+            var sel = dataGridView1.SelectedRows[0].DataBoundItem as Lobby;
+            if (sel == null || sel.id == 0)
             {
-                MessageBox.Show("Лобби уже заполнено!", "Предупреждение", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show("Невозможно подключиться", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
-            if (selectedLobby.IsPassword)
+            if (sel.isPassword && !string.IsNullOrEmpty(sel.password))
             {
-                string password = ShowPasswordDialog();
-                if (string.IsNullOrEmpty(password))
+                var enteredPassword = ShowPasswordDialog();
+                if (string.IsNullOrEmpty(enteredPassword) || enteredPassword != sel.password)
                 {
-                    return;
-                }
-
-                if (password != selectedLobby.Password)
-                {
-                    MessageBox.Show("Неверный пароль!", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    MessageBox.Show("Неверный пароль или отмена ввода", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
             }
 
-            var message = new Message
+            try
             {
-                messageType = MessageType.ConnectToGame,
-                data = BitConverter.GetBytes(selectedLobby.id)
-            };
+                var content = new StringContent(JsonSerializer.Serialize(new[] { playerId, sel.id }), Encoding.UTF8, "application/json");
+                var resp = await http.PostAsync("api/connectiontogame", content);
+                resp.EnsureSuccessStatusCode();
 
-            SendMessage(message);
+                currentLobbyId = sel.id;
+                isHost = false;
+                ShowGameControls();
+                lblGameStatus.Text = "Вы подключились. Ждём…";
+                richTextBox1.AppendText($"Подключились к '{sel.name} {sel.id}'\n");
 
-            isHost = false;
-            currentLobbyId = selectedLobby.id;
+                StartPollingReady();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Не удалось подключиться: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
 
-            ShowGameControls();
-            lblGameStatus.Text = "Подключение к игре...";
-            richTextBox1.AppendText($"Вы подключились к лобби '{selectedLobby.Name}'...\n");
+        private void StartPollingReady()
+        {
+            pollCts?.Cancel();
+            pollCts = new CancellationTokenSource();
+
+            Task.Run(async () =>
+            {
+                while (!pollCts.Token.IsCancellationRequested)
+                {
+                    await Task.Delay(2000, pollCts.Token);
+
+                    try
+                    {
+                        var content = new StringContent(currentLobbyId.ToString(), Encoding.UTF8, "application/json");
+                        var resp = await http.GetAsync($"api/areGameConnected/{currentLobbyId}");
+                        resp.EnsureSuccessStatusCode();
+
+                        var json = await resp.Content.ReadAsStringAsync();
+                        if (!string.IsNullOrEmpty(json) && json != "null")
+                        {
+                            BeginInvoke(async() =>
+                            {
+                                currentLobbyPlayerCount = 2;
+                                lblGameStatus.Text = "Оба игрока подключены!";
+                                if (!richTextBox1.Text.Contains("Оба игрока"))
+                                    richTextBox1.AppendText("Оба игрока подключены! Запуск игры...\n");
+                                //UpdateStartButtonState();
+                                btnStart.Enabled = true;
+                                btnStart.Text = "Старт";
+                                await Task.Delay(1000);
+                                await StartGame();
+                            });
+                            break;
+                        }
+                    }
+                    catch { }
+                }
+            }, pollCts.Token);
+        }
+
+        private async Task StartGame()
+        {
+            try
+            {
+                pollCts?.Cancel();
+                var selectedLobby = lobbies.FirstOrDefault(l => l.id == currentLobbyId);
+
+                if (selectedLobby == null)
+                {
+                    MessageBox.Show("Лобби не найдено!", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                PlayerTeam playerTeam = (selectedLobby.hostID == playerId) ? PlayerTeam.White : PlayerTeam.Black;
+                richTextBox1.AppendText($"Игра началась! Вы играете за {(playerTeam == PlayerTeam.White ? "белых" : "черных")}\n");
+
+                this.Hide();
+
+                // Создаем форму игры
+                Form1 gameForm = new Form1(playerId, currentLobbyId, playerTeam);
+
+                // Обработчик закрытия формы игры
+                gameForm.FormClosed += async (s, e) => {
+                    if (isHost)
+                    {
+                        await DeleteLobby(currentLobbyId);
+                    }
+                    this.Show();
+                    ShowLobbyControls();
+                    await RefreshLobbies();
+                };
+
+                // Показываем форму игры модально
+                gameForm.ShowDialog();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Не удалось запустить игру: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                this.Show(); // Показываем главную форму в случае ошибки
+            }
+        }
+
+        private void btnMove_Click(object sender, EventArgs e)
+        {
+            // Пример отправки хода
+            var move = new Move { UserId = playerId, chessField = /* здесь ваше состояние */ null };
+            _ = SendMove(move);
+        }
+
+        private async Task SendMove(Move move)
+        {
+            var content = new StringContent(JsonSerializer.Serialize(move), Encoding.UTF8, "application/json");
+            var resp = await http.PostAsync("api/movingInGame", content);
+            resp.EnsureSuccessStatusCode();
+
+            richTextBox1.AppendText("Ход отправлен\n");
         }
 
         private string ShowPasswordDialog()
@@ -525,125 +747,85 @@ namespace ChessClient
             return prompt.ShowDialog() == DialogResult.OK ? textBox.Text : "";
         }
 
-        private void btnBackToLobby_Click(object sender, EventArgs e)
+        private async void btnBackToLobby_Click(object sender, EventArgs e)
         {
-            isInGame = false;
-            isHost = false;
-            currentLobbyId = -1;
+            if (isHost)
+            {
+                await DeleteLobby(currentLobbyId);
+            }
+            pollCts?.Cancel();
             ShowLobbyControls();
-            Task.Run(async () => await RefreshLobbies());
+            await RefreshLobbies();
         }
 
-        private void btnStart_Click()
+        private async Task WaitBothJoined(int lobbyId)
         {
-            if (currentLobbyPlayerCount >= 2)
+            btnStart.Enabled = false;
+            while (true)
             {
-                Form1 form1 = new Form1();
-                form1.ShowDialog();
-            }
-        }
+                await Task.Delay(1000);
+                var resp = await http.PostAsync("api/areGameConnected",
+                    new StringContent(JsonSerializer.Serialize(lobbyId), Encoding.UTF8, "application/json"));
+                if (!resp.IsSuccessStatusCode) continue;
 
-        private void btnStart_Click(object sender, EventArgs e)
-        {
-            if (currentLobbyPlayerCount < 2) return;
-
-            var startMessage = new Message
-            {
-                messageType = MessageType.GameStart,
-                data = new byte[0]
-            };
-            SendMessage(startMessage);
-
-            var gameForm = new Form1(stream, isHost);
-            gameForm.Show();
-            this.Hide();
-        }
-
-        private void SendMessage(Message message)
-        {
-            if (stream == null) return;
-
-            try
-            {
-                byte[] buffer = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message));
-                stream.Write(buffer);
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"Ошибка отправки сообщения: {ex.Message}", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
-
-        private async void ListenForMessages()
-        {
-            byte[] buffer = new byte[4096];
-
-            try
-            {
-                while (client.Connected)
+                var fieldJson = await resp.Content.ReadAsStringAsync();
+                if (fieldJson != "null")
                 {
-                    int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
-                    if (bytesRead > 0)
-                    {
-                        string jsonData = Encoding.UTF8.GetString(buffer, 0, bytesRead).Split('\0')[0];
-                        var message = JsonSerializer.Deserialize<Message>(jsonData);
-
-                        this.Invoke(new Action(() => ProcessServerMessage(message)));
-                    }
+                    btnStart.Enabled = true;
+                    lblStatus.Text = "Оба в лобби — можно стартовать";
+                    return;
                 }
             }
-            catch (Exception ex)
-            {
-                this.Invoke(new Action(() => {
-                    if (!isInGame)
-                        MessageBox.Show($"Соединение с сервером потеряно: {ex.Message}", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                }));
-                Form1 form1 = new Form1();
-                form1.ShowDialog();
-            }
         }
 
-        private void ProcessServerMessage(Message message)
+        private async void btnStart_Click(object sender, EventArgs e)
         {
-            switch (message.messageType)
+            /*if (currentLobbyPlayerCount < 2)
             {
-                case MessageType.GetLobbys:
-                    string lobbiesJson = Encoding.UTF8.GetString(message.data);
-                    lobbies = JsonSerializer.Deserialize<List<Lobby>>(lobbiesJson) ?? new List<Lobby>();
-                    dataGridView1.DataSource = null;
-                    dataGridView1.DataSource = lobbies;
-                    break;
+                MessageBox.Show("Ожидаем второго игрока!", "Информация", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }*/
 
-                case MessageType.GameStart:
-                    currentLobbyPlayerCount = BitConverter.ToInt32(message.data, 0);
-                    isInGame = true;
-                    UpdateStartButtonState();
-                    lblGameStatus.Text = "Игра началась!";
-                    richTextBox1.AppendText("Игра началась! Удачи!\n");
-                    break;
-
-                case MessageType.MovingInGame:
-                    string moveData = Encoding.UTF8.GetString(message.data);
-                    richTextBox1.AppendText($"Ход противника: {moveData}\n");
-                    break;
-
-                case MessageType.Win:
-                    string winMessage = message.data.Length > 0 ? Encoding.UTF8.GetString(message.data) : "Игра окончена!";
-                    richTextBox1.AppendText($"{winMessage}\n");
-                    lblGameStatus.Text = "Игра завершена";
-                    isInGame = false;
-                    break;
-            }
+            await StartGame();
         }
 
-        private void Form2_FormClosing(object sender, FormClosingEventArgs e)
+        private async Task DeleteLobby(int lobbyId)
         {
             try
             {
-                stream?.Close();
-                client?.Close();
+                var content = new StringContent(lobbyId.ToString(), Encoding.UTF8, "application/json");
+                await http.PostAsync("api/deleteLobby", content);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Не удалось удалить лобби: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
+
+        protected override async void OnFormClosing(FormClosingEventArgs e)
+        {
+            // Отменяем все активные задачи при закрытии формы
+            if (isHost && currentLobbyId != 1)
+            {
+                await DeleteLobby(currentLobbyId);
+            }
+            base.OnFormClosing(e);
+        }
+        /*private async void btnStart_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                // Старт игры фактически на сервере — в вашей реализации отсутствует endpoint, но UI может вызвать публикацию хода
+                richTextBox1.AppendText("Игра началась!\n");
+                lblGameStatus.Text = "Игра началась!";
+                btnStart.Enabled = false;
+                Form1 form1 = new Form1(playerId, lobbyId, );
+                form1.ShowDialog();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Не удалось стартовать: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }*/
     }
 }
