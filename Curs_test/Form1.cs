@@ -220,6 +220,19 @@ namespace ChessClient
             StartGamePolling();
         }
 
+        private async void Form1_Load(object sender, EventArgs e)
+        {
+            var response = await httpClient.GetAsync($"api/areGameConnected/{lobbyId}");
+            if (response.IsSuccessStatusCode)
+            {
+                bool connected = bool.Parse(await response.Content.ReadAsStringAsync());
+                if (connected)
+                {
+                    StartGamePolling();
+                }
+            }
+        }
+
         private void InitializeGameState()
         {
             gameState = new GameState
@@ -528,37 +541,146 @@ namespace ChessClient
 
         private string GetPieceSymbol(ChessPiece piece)
         {
-            string[] whiteSymbols = { "", "♙", "♖", "♘", "♗", "♕", "♔" };
-            string[] blackSymbols = { "", "♟", "♜", "♞", "♝", "♛", "♚" };
-
-            return piece.Team == PlayerTeam.White ? whiteSymbols[(int)piece.Type] : blackSymbols[(int)piece.Type];
+            return piece.Team switch
+            {
+                PlayerTeam.White => piece.Type switch
+                {
+                    PieceType.Pawn => "♙",
+                    PieceType.Rook => "♖",
+                    PieceType.Knight => "♘",
+                    PieceType.Bishop => "♗",
+                    PieceType.Queen => "♕",
+                    PieceType.King => "♔",
+                    _ => ""
+                },
+                PlayerTeam.Black => piece.Type switch
+                {
+                    PieceType.Pawn => "♟",
+                    PieceType.Rook => "♜",
+                    PieceType.Knight => "♞",
+                    PieceType.Bishop => "♝",
+                    PieceType.Queen => "♛",
+                    PieceType.King => "♚",
+                    _ => ""
+                },
+                _ => ""
+            };
         }
 
         private async void Square_Click(object sender, EventArgs e)
         {
-            if (gameState.IsGameOver || !myTurn)
-            {
+            if (!myTurn || gameState.IsGameOver)
                 return;
-            }
 
-            Button clickedSquare = sender as Button;
-            Point position = (Point)clickedSquare.Tag;
-            ChessPiece clickedPiece = gameState.Board[position.X, position.Y];
+            Button btn = sender as Button;
+            Point coords = (Point)btn.Tag;
+            int row = coords.X;
+            int col = coords.Y;
 
-            // Если выбрана наша фигура
-            if (clickedPiece != null && clickedPiece.Team == myTeam)
+            var clickedPiece = gameState.Board[row, col];
+
+            if (selectedPiece == null)
             {
-                SelectPiece(position, clickedPiece);
+                // Выбор своей фигуры
+                if (clickedPiece != null && clickedPiece.Team == myTeam)
+                {
+                    selectedPiece = clickedPiece;
+                    HighlightValidMoves(selectedPiece);
+                }
             }
-            // Если кликнули по возможному ходу
-            else if (selectedPiece != null && validMoves.Contains(position))
-            {
-                await MakeMove(selectedSquare, position);
-            }
-            // Снять выделение
             else
             {
-                ClearSelection();
+                // Попытка хода
+                var move = new Point(row, col);
+                var validMoves = GetValidMoves(selectedPiece);
+
+                if (validMoves.Any(m => m.X == move.X && m.Y == move.Y))
+                {
+                    // Перемещаем фигуру
+                    gameState.Board[selectedPiece.X, selectedPiece.Y] = null;
+                    selectedPiece.X = move.X;
+                    selectedPiece.Y = move.Y;
+                    gameState.Board[move.X, move.Y] = selectedPiece;
+
+                    myTurn = false;
+
+                    UpdateGameInfo();
+                    RenderBoard();
+
+                    // Сохраняем ход на сервер
+                    await SendBoardUpdateToServer();
+                }
+
+                selectedPiece = null;
+                ClearHighlights();
+            }
+        }
+        private List<List<ChessPiece>> ConvertToList(ChessPiece[,] array)
+        {
+            var list = new List<List<ChessPiece>>();
+            for (int i = 0; i < 8; i++)
+            {
+                var row = new List<ChessPiece>();
+                for (int j = 0; j < 8; j++)
+                {
+                    row.Add(array[i, j]);
+                }
+                list.Add(row);
+            }
+            return list;
+        }
+
+        private ChessField BuildChessFieldForServer()
+        {
+            return new ChessField
+            {
+                Board = ConvertToList(gameState.Board),
+                CurrentPlayer = GetOppositeTeam(gameState.CurrentPlayer),
+                IsGameOver = gameState.IsGameOver,
+                Winner = gameState.Winner
+            };
+        }
+
+        private void HighlightValidMoves(ChessPiece piece)
+        {
+            var moves = GetValidMoves(piece);
+
+            foreach (var move in moves)
+            {
+                var btn = squares[move.X, move.Y];
+                btn.BackColor = Color.LightGreen;
+            }
+        }
+
+        private void ClearHighlights()
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                for (int j = 0; j < 8; j++)
+                {
+                    squares[i, j].BackColor = (i + j) % 2 == 0 ? Color.Beige : Color.Brown;
+                }
+            }
+        }
+
+        private void RenderBoard()
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                for (int j = 0; j < 8; j++)
+                {
+                    var btn = squares[i, j];
+                    var piece = gameState.Board[i, j];
+
+                    if (piece == null)
+                    {
+                        btn.Text = "";
+                    }
+                    else
+                    {
+                        btn.Text = GetPieceSymbol(piece);
+                    }
+                }
             }
         }
 
@@ -658,7 +780,7 @@ namespace ChessClient
                 var json = JsonSerializer.Serialize(move);
                 var content = new StringContent(json, Encoding.UTF8, "application/json");
 
-                var response = await httpClient.PostAsync("api/movingInGame", content);
+                var response = await httpClient.PostAsync("api/updateChessField", content);
 
                 if (!response.IsSuccessStatusCode)
                 {
@@ -676,7 +798,7 @@ namespace ChessClient
             }
         }
 
-        private ChessField BuildChessFieldForServer()
+        /*private ChessField BuildChessFieldForServer()
         {
             var field = new ChessField
             {
@@ -698,7 +820,7 @@ namespace ChessClient
             }
 
             return field;
-        }
+        }*/
 
         private void StartGamePolling()
         {
@@ -744,14 +866,26 @@ namespace ChessClient
         {
             try
             {
+                if (!serverField.Equals(BuildChessFieldForServer()))
+                {
+                    // Обновить локально
+                    UpdateGameStateFromServer(serverField);
+                    UpdateGameInfo();
+                }
                 // Проверка на окончание игры
                 if (serverField.IsGameOver && !gameState.IsGameOver)
                 {
                     BeginInvoke(() =>
                     {
+                        UpdateGameStateFromServer(serverField);
+                        myTurn = (serverField.CurrentPlayer == myTeam);
+                        UpdateGameInfo();
                         gameState.IsGameOver = true;
                         gameState.Winner = serverField.Winner;
-                        HandleGameEndFromServer(serverField);
+                        if (gameState.IsGameOver)
+                        {
+                            HandleGameEndFromServer(serverField);
+                        }
                     });
                     return;
                 }
@@ -769,6 +903,8 @@ namespace ChessClient
             gameState.IsGameOver = serverField.IsGameOver;
             gameState.Winner = serverField.Winner;
             gameState.IsInCheck = IsInCheck(gameState.CurrentPlayer);
+
+            myTurn = (gameState.CurrentPlayer == myTeam);
         }
 
         private ChessPiece[,] ConvertToArray(List<List<ChessPiece>> list)
@@ -783,6 +919,22 @@ namespace ChessClient
                 }
             }
             return array;
+        }
+
+        private async Task SendBoardUpdateToServer()
+        {
+            var lobbyEntity = new
+            {
+                Id = lobbyId,
+                ChessFieldJson = JsonSerializer.Serialize(BuildChessFieldForServer()),
+                Final = gameState.IsGameOver
+            };
+
+            var json = JsonSerializer.Serialize(lobbyEntity);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+            var response = await httpClient.PostAsync("api/updateChessField", content);
+            response.EnsureSuccessStatusCode();
         }
 
         private void HandleGameEndFromServer(ChessField serverField)
@@ -840,7 +992,7 @@ namespace ChessClient
                 var json = JsonSerializer.Serialize(gameResult);
                 var content = new StringContent(json, Encoding.UTF8, "application/json");
 
-                string endpoint = result == "win" ? "api/Win" : "api/Draw";
+                string endpoint = result == "win" ? "api/Win" : "api/surrender";
                 await httpClient.PostAsync(endpoint, content);
             }
             catch (Exception ex)
@@ -1419,7 +1571,7 @@ namespace ChessClient
             var json = JsonSerializer.Serialize(surrenderData);
             var content = new StringContent(json, Encoding.UTF8, "application/json");
 
-            var response = await httpClient.PostAsync("api/Surrender", content);
+            var response = await httpClient.PostAsync("api/surrender", content);
             response.EnsureSuccessStatusCode();
         }
 
@@ -1435,7 +1587,7 @@ namespace ChessClient
             var json = JsonSerializer.Serialize(drawData);
             var content = new StringContent(json, Encoding.UTF8, "application/json");
 
-            var response = await httpClient.PostAsync("api/OfferDraw", content);
+            var response = await httpClient.PostAsync("api/surrender", content);
             response.EnsureSuccessStatusCode();
         }
 
