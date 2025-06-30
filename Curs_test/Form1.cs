@@ -1,5 +1,4 @@
-﻿using Microsoft.VisualBasic.ApplicationServices;
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
@@ -12,6 +11,98 @@ using System.Windows.Forms;
 
 namespace ChessClient
 {
+    using System.Net.Http;
+    using System.Text;
+    using System.Text.Json;
+
+    public class ChessClientApi
+    {
+        private readonly HttpClient _httpClient;
+        private readonly string _baseUrl;
+
+        public ChessClientApi(string baseUrl)
+        {
+            _baseUrl = baseUrl.TrimEnd('/');
+            _httpClient = new HttpClient();
+        }
+
+        public async Task<int> RegisterName(string name)
+        {
+            var content = new StringContent($"\"{name}\"", Encoding.UTF8, "application/json");
+            var response = await _httpClient.PostAsync($"{_baseUrl}/api/Name", content);
+            response.EnsureSuccessStatusCode();
+            var json = await response.Content.ReadAsStringAsync();
+            return int.Parse(json);
+        }
+
+        public async Task<int> StartNewGame(Lobby lobby)
+        {
+            var json = JsonSerializer.Serialize(lobby);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+            var response = await _httpClient.PostAsync($"{_baseUrl}/api/startNewGame", content);
+            response.EnsureSuccessStatusCode();
+            var result = await response.Content.ReadAsStringAsync();
+            return int.Parse(result);
+        }
+
+        public async Task<List<Lobby>> GetLobbies()
+        {
+            var response = await _httpClient.GetAsync($"{_baseUrl}/api/lobby");
+            response.EnsureSuccessStatusCode();
+            var json = await response.Content.ReadAsStringAsync();
+            return JsonSerializer.Deserialize<List<Lobby>>(json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        }
+
+        public async Task<bool> ConnectToGame(int userId, int lobbyId)
+        {
+            var data = new int[] { userId, lobbyId };
+            var json = JsonSerializer.Serialize(data);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+            var response = await _httpClient.PostAsync($"{_baseUrl}/api/connectiontogame", content);
+            return response.IsSuccessStatusCode;
+        }
+
+        public async Task UpdateChessField(Lobby lobby)
+        {
+            var json = JsonSerializer.Serialize(new
+            {
+                Id = lobby.id,
+                ChessFieldJson = JsonSerializer.Serialize(lobby.chessField),
+                Final = lobby.final
+            });
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+            var response = await _httpClient.PostAsync($"{_baseUrl}/api/updateChessField", content);
+            response.EnsureSuccessStatusCode();
+        }
+
+        public async Task<ChessField> GetChessField(int lobbyId)
+        {
+            var response = await _httpClient.GetAsync($"{_baseUrl}/api/getChessField/{lobbyId}");
+            response.EnsureSuccessStatusCode();
+            var json = await response.Content.ReadAsStringAsync();
+            return string.IsNullOrEmpty(json) ? new ChessField() :
+                JsonSerializer.Deserialize<ChessField>(json);
+        }
+
+        public async Task<bool> CheckIfGameConnected(int lobbyId)
+        {
+            var response = await _httpClient.GetAsync($"{_baseUrl}/api/areGameConnected/{lobbyId}");
+            response.EnsureSuccessStatusCode();
+            var json = await response.Content.ReadAsStringAsync();
+            return bool.Parse(json);
+        }
+
+        public async Task Surrender(int userId, int lobbyId)
+        {
+            var data = new int[] { userId, lobbyId };
+            var json = JsonSerializer.Serialize(data);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+            var response = await _httpClient.PostAsync($"{_baseUrl}/api/surrender", content);
+            response.EnsureSuccessStatusCode();
+        }
+    }
+
+    // Основные модели данных
     public enum PieceType
     {
         None, Pawn, Rook, Knight, Bishop, Queen, King
@@ -20,6 +111,21 @@ namespace ChessClient
     public enum PlayerTeam
     {
         White, Black
+    }
+
+    public enum GameStatus
+    {
+        WaitingForPlayers,
+        InProgress,
+        Finished,
+        Abandoned
+    }
+
+    public class GameStatusResponse
+    {
+        public bool IsGameOver { get; set; }
+        public bool Final { get; set; }
+        public PlayerTeam? Winner { get; set; }
     }
 
     public class ChessPiece
@@ -41,139 +147,231 @@ namespace ChessClient
             HasMoved = false;
         }
 
+        public ChessPiece Clone()
+        {
+            return new ChessPiece(Type, Team, X, Y) { HasMoved = HasMoved };
+        }
     }
 
+    public class GameState
+    {
+        public ChessPiece[,] Board { get; set; }
+        public PlayerTeam CurrentPlayer { get; set; }
+        public bool IsGameOver { get; set; }
+        public PlayerTeam? Winner { get; set; }
+        public Point? LastMoveFrom { get; set; }
+        public Point? LastMoveTo { get; set; }
+        public bool IsInCheck { get; set; }
+        public int MoveCount { get; set; }
+    }
+
+    // Основная форма игры
     public partial class Form1 : Form
     {
-        private readonly HttpClient http = new HttpClient();
-        private const string baseUrl = "https://serverforchess-production.up.railway.app/";
+        private readonly HttpClient httpClient;
+        private const string BASE_URL = "https://serverforchess-production.up.railway.app/";
 
+        // Игровые параметры
+        private readonly int playerId;
+        private readonly int lobbyId;
+        private readonly PlayerTeam myTeam;
+        private GameState gameState;
+
+        // UI элементы
         private Panel boardPanel;
         private Button[,] squares;
-        private ChessPiece[,] board;
-        private ChessPiece selectedPiece;
-        private Point selectedSquare = new Point(-1, -1);
-        private List<Point> validMoves = new List<Point>();
-
-        private PlayerTeam currentPlayer = PlayerTeam.White;
-        private PlayerTeam myTeam;
-        private bool gameStarted = false;
-        private bool myTurn = false;
-
+        private Panel infoPanel;
         private Label lblGameInfo;
         private Label lblTurnInfo;
+        private Label lblStatusInfo;
         private Button btnSurrender;
-        private Panel infoPanel;
+        private Button btnDrawOffer;
+        private ProgressBar progressBarThinking;
 
-        private int playerId;
-        private int lobbyId;
-        private CancellationTokenSource pollCts;
+        // Игровая логика
+        private Point selectedSquare = new Point(-1, -1);
+        private ChessPiece selectedPiece;
+        private List<Point> validMoves = new List<Point>();
+        private bool myTurn = false;
+        private CancellationTokenSource pollingCts;
+
+        // Константы для UI
+        private const int SQUARE_SIZE = 70;
+        private const int BOARD_OFFSET = 35;
+        private static readonly Color LIGHT_SQUARE = Color.FromArgb(240, 217, 181);
+        private static readonly Color DARK_SQUARE = Color.FromArgb(181, 136, 99);
+        private static readonly Color SELECTED_SQUARE = Color.FromArgb(255, 255, 0);
+        private static readonly Color VALID_MOVE = Color.FromArgb(144, 238, 144);
+        private static readonly Color CHECK_HIGHLIGHT = Color.FromArgb(255, 99, 99);
+        private static readonly Color LAST_MOVE_HIGHLIGHT = Color.FromArgb(255, 255, 204);
 
         public Form1(int playerId, int lobbyId, PlayerTeam team)
         {
-            http.BaseAddress = new Uri(baseUrl);
             this.playerId = playerId;
             this.lobbyId = lobbyId;
             this.myTeam = team;
-            this.currentPlayer = PlayerTeam.White;
-            this.myTurn = (team == PlayerTeam.White);
-            gameStarted = true;
 
-            MessageBox.Show($"Form1 открыта. myTeam = {myTeam}, myTurn = {myTurn}");
-            // InitializeComponent();
-            SetupForm();
-            SetupBoard();
-            InitializeBoard();
-            UpdateGameInfo();
+            httpClient = new HttpClient();
+            httpClient.BaseAddress = new Uri(BASE_URL);
+            httpClient.Timeout = TimeSpan.FromSeconds(30);
+
+            InitializeGameState();
+            InitializeUI();
             StartGamePolling();
         }
 
-        private void SetupForm()
+        private void InitializeGameState()
         {
-            this.Text = "Шахматы";
-            this.Size = new Size(900, 700);
+            gameState = new GameState
+            {
+                Board = new ChessPiece[8, 8],
+                CurrentPlayer = PlayerTeam.White,
+                IsGameOver = false,
+                Winner = null,
+                MoveCount = 0
+            };
+
+            myTurn = (myTeam == PlayerTeam.White);
+            InitializeChessBoard();
+        }
+
+        private void InitializeUI()
+        {
+            SetupMainForm();
+            SetupInfoPanel();
+            SetupBoardPanel();
+            SetupBoardSquares();
+            AddBoardLabels();
+            UpdateBoardDisplay();
+            UpdateGameInfo();
+        }
+
+        private void SetupMainForm()
+        {
+            this.Text = $"Шахматы - Игрок {playerId} ({(myTeam == PlayerTeam.White ? "Белые" : "Черные")})";
+            this.Size = new Size(950, 750);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
             this.MaximizeBox = false;
             this.BackColor = Color.FromArgb(240, 217, 181);
+            this.FormClosing += ChessGameForm_FormClosing;
+        }
 
-            // Панель информации
-            infoPanel = new Panel();
-            infoPanel.Location = new Point(650, 20);
-            infoPanel.Size = new Size(220, 600);
-            infoPanel.BackColor = Color.FromArgb(181, 136, 99);
-            infoPanel.BorderStyle = BorderStyle.FixedSingle;
+        private void SetupInfoPanel()
+        {
+            infoPanel = new Panel
+            {
+                Location = new Point(650, 20),
+                Size = new Size(270, 680),
+                BackColor = Color.FromArgb(181, 136, 99),
+                BorderStyle = BorderStyle.FixedSingle
+            };
             this.Controls.Add(infoPanel);
 
-            lblGameInfo = new Label();
-            lblGameInfo.Text = "Шахматная партия";
-            lblGameInfo.Font = new Font("Arial", 14, FontStyle.Bold);
-            lblGameInfo.ForeColor = Color.White;
-            lblGameInfo.Location = new Point(10, 20);
-            lblGameInfo.Size = new Size(200, 30);
-            lblGameInfo.TextAlign = ContentAlignment.MiddleCenter;
+            lblGameInfo = new Label
+            {
+                Text = "Шахматная партия",
+                Font = new Font("Arial", 14, FontStyle.Bold),
+                ForeColor = Color.White,
+                Location = new Point(10, 20),
+                Size = new Size(250, 30),
+                TextAlign = ContentAlignment.MiddleCenter
+            };
             infoPanel.Controls.Add(lblGameInfo);
 
-            lblTurnInfo = new Label();
-            lblTurnInfo.Text = "Ход белых";
-            lblTurnInfo.Font = new Font("Arial", 12, FontStyle.Regular);
-            lblTurnInfo.ForeColor = Color.White;
-            lblTurnInfo.Location = new Point(10, 60);
-            lblTurnInfo.Size = new Size(200, 25);
-            lblTurnInfo.TextAlign = ContentAlignment.MiddleCenter;
+            lblTurnInfo = new Label
+            {
+                Text = "Ход белых",
+                Font = new Font("Arial", 12, FontStyle.Regular),
+                ForeColor = Color.White,
+                Location = new Point(10, 60),
+                Size = new Size(250, 25),
+                TextAlign = ContentAlignment.MiddleCenter
+            };
             infoPanel.Controls.Add(lblTurnInfo);
 
-            btnSurrender = new Button();
-            btnSurrender.Text = "Сдаться";
-            btnSurrender.Font = new Font("Arial", 10, FontStyle.Bold);
-            btnSurrender.Location = new Point(10, 500);
-            btnSurrender.Size = new Size(200, 40);
-            btnSurrender.BackColor = Color.FromArgb(139, 69, 19);
-            btnSurrender.ForeColor = Color.White;
-            btnSurrender.FlatStyle = FlatStyle.Flat;
+            lblStatusInfo = new Label
+            {
+                Text = "Ожидание хода противника...",
+                Font = new Font("Arial", 10, FontStyle.Regular),
+                ForeColor = Color.LightGray,
+                Location = new Point(10, 90),
+                Size = new Size(250, 40),
+                TextAlign = ContentAlignment.MiddleCenter
+            };
+            infoPanel.Controls.Add(lblStatusInfo);
+
+            progressBarThinking = new ProgressBar
+            {
+                Location = new Point(10, 140),
+                Size = new Size(250, 20),
+                Style = ProgressBarStyle.Marquee,
+                Visible = false
+            };
+            infoPanel.Controls.Add(progressBarThinking);
+
+            btnSurrender = new Button
+            {
+                Text = "Сдаться",
+                Font = new Font("Arial", 10, FontStyle.Bold),
+                Location = new Point(10, 580),
+                Size = new Size(120, 40),
+                BackColor = Color.FromArgb(139, 69, 19),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat
+            };
             btnSurrender.Click += BtnSurrender_Click;
             infoPanel.Controls.Add(btnSurrender);
 
-            // Панель доски
-            boardPanel = new Panel();
-            boardPanel.Location = new Point(20, 20);
-            boardPanel.Size = new Size(600, 600);
-            boardPanel.BackColor = Color.FromArgb(139, 69, 19);
-            boardPanel.BorderStyle = BorderStyle.Fixed3D;
+            btnDrawOffer = new Button
+            {
+                Text = "Предложить ничью",
+                Font = new Font("Arial", 9, FontStyle.Bold),
+                Location = new Point(140, 580),
+                Size = new Size(120, 40),
+                BackColor = Color.FromArgb(139, 69, 19),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat
+            };
+            btnDrawOffer.Click += BtnDrawOffer_Click;
+            infoPanel.Controls.Add(btnDrawOffer);
+        }
+
+        private void SetupBoardPanel()
+        {
+            boardPanel = new Panel
+            {
+                Location = new Point(20, 20),
+                Size = new Size(SQUARE_SIZE * 8 + BOARD_OFFSET * 2, SQUARE_SIZE * 8 + BOARD_OFFSET * 2),
+                BackColor = Color.FromArgb(139, 69, 19),
+                BorderStyle = BorderStyle.Fixed3D
+            };
             this.Controls.Add(boardPanel);
         }
 
-        private void SetupBoard()
+        private void SetupBoardSquares()
         {
             squares = new Button[8, 8];
-            board = new ChessPiece[8, 8];
-
-            int buttonSize = 70;
-            int offset = 35;
-
-            boardPanel.Size = new Size(buttonSize * 8 + offset * 2, buttonSize * 8 + offset * 2);
 
             for (int row = 0; row < 8; row++)
             {
                 for (int col = 0; col < 8; col++)
                 {
-                    Button square = new Button();
-                    square.Size = new Size(buttonSize, buttonSize);
-                    square.Margin = new Padding(0);
-                    square.Padding = new Padding(0);
-                    square.Location = new Point(col * buttonSize + offset, row * buttonSize + offset);
-                    square.Font = new Font("Arial", 28, FontStyle.Bold);
-                    square.FlatStyle = FlatStyle.Flat;
+                    Button square = new Button
+                    {
+                        Size = new Size(SQUARE_SIZE, SQUARE_SIZE),
+                        Location = new Point(col * SQUARE_SIZE + BOARD_OFFSET, row * SQUARE_SIZE + BOARD_OFFSET),
+                        Font = new Font("Arial", 28, FontStyle.Bold),
+                        FlatStyle = FlatStyle.Flat,
+                        Margin = new Padding(0),
+                        Padding = new Padding(0),
+                        Tag = new Point(row, col)
+                    };
+
                     square.FlatAppearance.BorderSize = 2;
                     square.FlatAppearance.BorderColor = Color.Black;
+                    square.BackColor = (row + col) % 2 == 0 ? LIGHT_SQUARE : DARK_SQUARE;
 
-                    // Цвет клетки
-                    if ((row + col) % 2 == 0)
-                        square.BackColor = Color.FromArgb(240, 217, 181); // Светлые клетки
-                    else
-                        square.BackColor = Color.FromArgb(181, 136, 99);  // Темные клетки
-
-                    square.Tag = new Point(row, col);
                     square.Click += Square_Click;
                     square.MouseEnter += Square_MouseEnter;
                     square.MouseLeave += Square_MouseLeave;
@@ -182,91 +380,93 @@ namespace ChessClient
                     boardPanel.Controls.Add(square);
                 }
             }
+        }
 
-            // Добавляем буквы сверху и снизу
+        private void AddBoardLabels()
+        {
+            // Буквы сверху и снизу
             for (int i = 0; i < 8; i++)
             {
                 char letter = (char)('A' + i);
 
-                Label topLabel = new Label();
-                topLabel.Text = letter.ToString();
-                topLabel.Size = new Size(buttonSize, 25);
-                topLabel.Location = new Point(i * buttonSize + offset, 0);
-                topLabel.TextAlign = ContentAlignment.MiddleCenter;
+                Label topLabel = new Label
+                {
+                    Text = letter.ToString(),
+                    Size = new Size(SQUARE_SIZE, 25),
+                    Location = new Point(i * SQUARE_SIZE + BOARD_OFFSET, 5),
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Font = new Font("Arial", 12, FontStyle.Bold),
+                    ForeColor = Color.White
+                };
                 boardPanel.Controls.Add(topLabel);
 
-                Label bottomLabel = new Label();
-                bottomLabel.Text = letter.ToString();
-                bottomLabel.Size = new Size(buttonSize, 25);
-                bottomLabel.Location = new Point(i * buttonSize + offset, offset + buttonSize * 8);
-                bottomLabel.TextAlign = ContentAlignment.MiddleCenter;
+                Label bottomLabel = new Label
+                {
+                    Text = letter.ToString(),
+                    Size = new Size(SQUARE_SIZE, 25),
+                    Location = new Point(i * SQUARE_SIZE + BOARD_OFFSET, BOARD_OFFSET + SQUARE_SIZE * 8 + 5),
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Font = new Font("Arial", 12, FontStyle.Bold),
+                    ForeColor = Color.White
+                };
                 boardPanel.Controls.Add(bottomLabel);
             }
 
-            // Добавляем цифры слева и справа
+            // Цифры слева и справа
             for (int i = 0; i < 8; i++)
             {
                 int number = 8 - i;
 
-                Label leftLabel = new Label();
-                leftLabel.Text = number.ToString();
-                leftLabel.Size = new Size(25, buttonSize);
-                leftLabel.Location = new Point(0, i * buttonSize + offset);
-                leftLabel.TextAlign = ContentAlignment.MiddleCenter;
+                Label leftLabel = new Label
+                {
+                    Text = number.ToString(),
+                    Size = new Size(25, SQUARE_SIZE),
+                    Location = new Point(5, i * SQUARE_SIZE + BOARD_OFFSET),
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Font = new Font("Arial", 12, FontStyle.Bold),
+                    ForeColor = Color.White
+                };
                 boardPanel.Controls.Add(leftLabel);
 
-                Label rightLabel = new Label();
-                rightLabel.Text = number.ToString();
-                rightLabel.Size = new Size(25, buttonSize);
-                rightLabel.Location = new Point(offset + buttonSize * 8, i * buttonSize + offset);
-                rightLabel.TextAlign = ContentAlignment.MiddleCenter;
+                Label rightLabel = new Label
+                {
+                    Text = number.ToString(),
+                    Size = new Size(25, SQUARE_SIZE),
+                    Location = new Point(BOARD_OFFSET + SQUARE_SIZE * 8 + 5, i * SQUARE_SIZE + BOARD_OFFSET),
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Font = new Font("Arial", 12, FontStyle.Bold),
+                    ForeColor = Color.White
+                };
                 boardPanel.Controls.Add(rightLabel);
             }
         }
 
-        private void InitializeBoard()
+        private void InitializeChessBoard()
         {
             // Очистка доски
             for (int i = 0; i < 8; i++)
             {
                 for (int j = 0; j < 8; j++)
                 {
-                    board[i, j] = null;
+                    gameState.Board[i, j] = null;
                 }
             }
 
-            // Расстановка фигур
             // Черные фигуры (верх доски)
-            board[0, 0] = new ChessPiece(PieceType.Rook, PlayerTeam.Black, 0, 0);
-            board[0, 1] = new ChessPiece(PieceType.Knight, PlayerTeam.Black, 0, 1);
-            board[0, 2] = new ChessPiece(PieceType.Bishop, PlayerTeam.Black, 0, 2);
-            board[0, 3] = new ChessPiece(PieceType.Queen, PlayerTeam.Black, 0, 3);
-            board[0, 4] = new ChessPiece(PieceType.King, PlayerTeam.Black, 0, 4);
-            board[0, 5] = new ChessPiece(PieceType.Bishop, PlayerTeam.Black, 0, 5);
-            board[0, 6] = new ChessPiece(PieceType.Knight, PlayerTeam.Black, 0, 6);
-            board[0, 7] = new ChessPiece(PieceType.Rook, PlayerTeam.Black, 0, 7);
-
+            var blackPieces = new PieceType[] { PieceType.Rook, PieceType.Knight, PieceType.Bishop, PieceType.Queen, PieceType.King, PieceType.Bishop, PieceType.Knight, PieceType.Rook };
             for (int col = 0; col < 8; col++)
             {
-                board[1, col] = new ChessPiece(PieceType.Pawn, PlayerTeam.Black, 1, col);
+                gameState.Board[0, col] = new ChessPiece(blackPieces[col], PlayerTeam.Black, 0, col);
+                gameState.Board[1, col] = new ChessPiece(PieceType.Pawn, PlayerTeam.Black, 1, col);
             }
 
             // Белые фигуры (низ доски)
-            board[7, 0] = new ChessPiece(PieceType.Rook, PlayerTeam.White, 7, 0);
-            board[7, 1] = new ChessPiece(PieceType.Knight, PlayerTeam.White, 7, 1);
-            board[7, 2] = new ChessPiece(PieceType.Bishop, PlayerTeam.White, 7, 2);
-            board[7, 3] = new ChessPiece(PieceType.Queen, PlayerTeam.White, 7, 3);
-            board[7, 4] = new ChessPiece(PieceType.King, PlayerTeam.White, 7, 4);
-            board[7, 5] = new ChessPiece(PieceType.Bishop, PlayerTeam.White, 7, 5);
-            board[7, 6] = new ChessPiece(PieceType.Knight, PlayerTeam.White, 7, 6);
-            board[7, 7] = new ChessPiece(PieceType.Rook, PlayerTeam.White, 7, 7);
-
+            var whitePieces = new PieceType[] { PieceType.Rook, PieceType.Knight, PieceType.Bishop, PieceType.Queen, PieceType.King, PieceType.Bishop, PieceType.Knight, PieceType.Rook };
             for (int col = 0; col < 8; col++)
             {
-                board[6, col] = new ChessPiece(PieceType.Pawn, PlayerTeam.White, 6, col);
+                gameState.Board[7, col] = new ChessPiece(whitePieces[col], PlayerTeam.White, 7, col);
+                gameState.Board[6, col] = new ChessPiece(PieceType.Pawn, PlayerTeam.White, 6, col);
             }
-
-            UpdateBoardDisplay();
         }
 
         private void UpdateBoardDisplay()
@@ -276,8 +476,9 @@ namespace ChessClient
                 for (int col = 0; col < 8; col++)
                 {
                     Button square = squares[row, col];
-                    ChessPiece piece = board[row, col];
+                    ChessPiece piece = gameState.Board[row, col];
 
+                    // Установка текста фигуры
                     if (piece != null)
                     {
                         square.Text = GetPieceSymbol(piece);
@@ -288,24 +489,40 @@ namespace ChessClient
                         square.Text = "";
                     }
 
-                    // Сброс цвета клетки
-                    if ((row + col) % 2 == 0)
-                        square.BackColor = Color.FromArgb(240, 217, 181);
-                    else
-                        square.BackColor = Color.FromArgb(181, 136, 99);
+                    // Сброс цвета клетки к базовому
+                    square.BackColor = (row + col) % 2 == 0 ? LIGHT_SQUARE : DARK_SQUARE;
                 }
+            }
+
+            // Подсветка последнего хода
+            if (gameState.LastMoveFrom.HasValue && gameState.LastMoveTo.HasValue)
+            {
+                var from = gameState.LastMoveFrom.Value;
+                var to = gameState.LastMoveTo.Value;
+                squares[from.X, from.Y].BackColor = LAST_MOVE_HIGHLIGHT;
+                squares[to.X, to.Y].BackColor = LAST_MOVE_HIGHLIGHT;
             }
 
             // Подсветка выбранной фигуры
             if (selectedSquare.X != -1 && selectedSquare.Y != -1)
             {
-                squares[selectedSquare.X, selectedSquare.Y].BackColor = Color.Yellow;
+                squares[selectedSquare.X, selectedSquare.Y].BackColor = SELECTED_SQUARE;
             }
 
             // Подсветка возможных ходов
             foreach (Point move in validMoves)
             {
-                squares[move.X, move.Y].BackColor = Color.LightGreen;
+                squares[move.X, move.Y].BackColor = VALID_MOVE;
+            }
+
+            // Подсветка шаха
+            if (gameState.IsInCheck)
+            {
+                Point kingPos = FindKing(gameState.CurrentPlayer);
+                if (kingPos.X != -1)
+                {
+                    squares[kingPos.X, kingPos.Y].BackColor = CHECK_HIGHLIGHT;
+                }
             }
         }
 
@@ -317,18 +534,16 @@ namespace ChessClient
             return piece.Team == PlayerTeam.White ? whiteSymbols[(int)piece.Type] : blackSymbols[(int)piece.Type];
         }
 
-        private void Square_Click(object sender, EventArgs e)
+        private async void Square_Click(object sender, EventArgs e)
         {
-            if (!gameStarted || !myTurn)
+            if (gameState.IsGameOver || !myTurn)
             {
-                Console.WriteLine($"Клик заблокирован: gameStarted={gameStarted}, myTurn={myTurn}");
                 return;
             }
 
             Button clickedSquare = sender as Button;
             Point position = (Point)clickedSquare.Tag;
-
-            ChessPiece clickedPiece = board[position.X, position.Y];
+            ChessPiece clickedPiece = gameState.Board[position.X, position.Y];
 
             // Если выбрана наша фигура
             if (clickedPiece != null && clickedPiece.Team == myTeam)
@@ -338,7 +553,7 @@ namespace ChessClient
             // Если кликнули по возможному ходу
             else if (selectedPiece != null && validMoves.Contains(position))
             {
-                MakeMove(selectedSquare, position);
+                await MakeMove(selectedSquare, position);
             }
             // Снять выделение
             else
@@ -363,51 +578,316 @@ namespace ChessClient
             UpdateBoardDisplay();
         }
 
-        private async void MakeMove(Point from, Point to)
+        private async Task MakeMove(Point from, Point to)
         {
-            // Проверка на взятие фигуры
-            ChessPiece capturedPiece = board[to.X, to.Y];
-
-            // Выполнение хода
-            board[to.X, to.Y] = selectedPiece;
-            board[from.X, from.Y] = null;
-            selectedPiece.X = to.X;
-            selectedPiece.Y = to.Y;
-            selectedPiece.HasMoved = true;
-
-            // Проверка на превращение пешки
-            if (selectedPiece.Type == PieceType.Pawn)
+            try
             {
-                if ((selectedPiece.Team == PlayerTeam.White && to.X == 0) ||
-                    (selectedPiece.Team == PlayerTeam.Black && to.X == 7))
+                // Сохранение информации о последнем ходе
+                gameState.LastMoveFrom = from;
+                gameState.LastMoveTo = to;
+
+                // Выполнение хода
+                ChessPiece movingPiece = gameState.Board[from.X, from.Y];
+                ChessPiece capturedPiece = gameState.Board[to.X, to.Y];
+
+                gameState.Board[to.X, to.Y] = movingPiece;
+                gameState.Board[from.X, from.Y] = null;
+                movingPiece.X = to.X;
+                movingPiece.Y = to.Y;
+                movingPiece.HasMoved = true;
+
+                // Проверка на превращение пешки
+                if (movingPiece.Type == PieceType.Pawn)
                 {
-                    // Превращение в ферзя
-                    selectedPiece.Type = PieceType.Queen;
+                    if ((movingPiece.Team == PlayerTeam.White && to.X == 0) ||
+                        (movingPiece.Team == PlayerTeam.Black && to.X == 7))
+                    {
+                        movingPiece.Type = PieceType.Queen; // Автоматическое превращение в ферзя
+                    }
+                }
+
+                // Обновление игрового состояния
+                gameState.CurrentPlayer = gameState.CurrentPlayer == PlayerTeam.White ? PlayerTeam.Black : PlayerTeam.White;
+                gameState.MoveCount++;
+                gameState.IsInCheck = IsInCheck(gameState.CurrentPlayer);
+
+                // Проверка на окончание игры
+                if (IsCheckmate(gameState.CurrentPlayer))
+                {
+                    gameState.IsGameOver = true;
+                    gameState.Winner = myTeam;
+                }
+                else if (IsStalemate(gameState.CurrentPlayer))
+                {
+                    gameState.IsGameOver = true;
+                    gameState.Winner = null; // Ничья
+                }
+
+                ClearSelection();
+                myTurn = false;
+                UpdateBoardDisplay();
+                UpdateGameInfo();
+
+                // Отправка хода на сервер
+                await SendMoveToServer(from, to);
+
+                if (gameState.IsGameOver)
+                {
+                    await HandleGameEnd();
                 }
             }
-
-            ClearSelection();
-            myTurn = false;
-            UpdateBoardDisplay();
-            UpdateGameInfo();
-
-            // Отправка хода на сервер
-            await UpdateServerChessField();
-            myTurn = false;
-            // Проверка на мат/шах
-            PlayerTeam opponentTeam = myTeam == PlayerTeam.White ? PlayerTeam.Black : PlayerTeam.White;
-            if (IsCheckmate(opponentTeam))
+            catch (Exception ex)
             {
-                await SendWinToServer();
-                MessageBox.Show($"Шах и мат! Вы победили!", "Игра окончена",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
-                this.Close();
+                MessageBox.Show($"Ошибка при выполнении хода: {ex.Message}", "Ошибка",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
+        private async Task SendMoveToServer(Point from, Point to)
+        {
+            try
+            {
+                var chessField = BuildChessFieldForServer();
+                var move = new Move
+                {
+                    UserId = playerId,
+                    LobbyId = lobbyId,
+                    chessField = chessField
+                };
+
+                var json = JsonSerializer.Serialize(move);
+                var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                var response = await httpClient.PostAsync("api/movingInGame", content);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    var errorContent = await response.Content.ReadAsStringAsync();
+                    throw new HttpRequestException($"Сервер вернул ошибку: {response.StatusCode}. {errorContent}");
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Ошибка при отправке хода на сервер: {ex.Message}", "Ошибка сети",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+
+                // Откат хода при ошибке сети
+                // Здесь можно добавить логику отката
+            }
+        }
+
+        private ChessField BuildChessFieldForServer()
+        {
+            var field = new ChessField
+            {
+                Board = new List<List<ChessPiece>>(),
+                CurrentPlayer = gameState.CurrentPlayer,
+                IsGameOver = gameState.IsGameOver,
+                Winner = gameState.Winner
+            };
+
+            for (int i = 0; i < 8; i++)
+            {
+                var row = new List<ChessPiece>();
+                for (int j = 0; j < 8; j++)
+                {
+                    var piece = gameState.Board[i, j];
+                    row.Add(piece?.Clone() ?? new ChessPiece());
+                }
+                field.Board.Add(row);
+            }
+
+            return field;
+        }
+
+        private void StartGamePolling()
+        {
+            pollingCts?.Cancel();
+            pollingCts = new CancellationTokenSource();
+
+            Task.Run(async () =>
+            {
+                while (!pollingCts.Token.IsCancellationRequested && !gameState.IsGameOver)
+                {
+                    try
+                    {
+                        await Task.Delay(1000, pollingCts.Token); // Опрос каждую секунду
+
+                        var response = await httpClient.GetAsync($"api/getChessField/{lobbyId}");
+                        if (response.IsSuccessStatusCode)
+                        {
+                            var json = await response.Content.ReadAsStringAsync();
+                            if (!string.IsNullOrWhiteSpace(json) && json != "null")
+                            {
+                                var serverField = JsonSerializer.Deserialize<ChessField>(json);
+                                if (serverField != null)
+                                {
+                                    await ProcessServerUpdate(serverField);
+                                }
+                            }
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Polling error: {ex.Message}");
+                        // Продолжаем опрос даже при ошибках
+                    }
+                }
+            }, pollingCts.Token);
+        }
+
+        private async Task ProcessServerUpdate(ChessField serverField)
+        {
+            try
+            {
+                // Проверка на окончание игры
+                if (serverField.IsGameOver && !gameState.IsGameOver)
+                {
+                    BeginInvoke(() =>
+                    {
+                        gameState.IsGameOver = true;
+                        gameState.Winner = serverField.Winner;
+                        HandleGameEndFromServer(serverField);
+                    });
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error processing server update: {ex.Message}");
+            }
+        }
+
+        private void UpdateGameStateFromServer(ChessField serverField)
+        {
+            gameState.Board = ConvertToArray(serverField.Board);
+            gameState.CurrentPlayer = serverField.CurrentPlayer;
+            gameState.IsGameOver = serverField.IsGameOver;
+            gameState.Winner = serverField.Winner;
+            gameState.IsInCheck = IsInCheck(gameState.CurrentPlayer);
+        }
+
+        private ChessPiece[,] ConvertToArray(List<List<ChessPiece>> list)
+        {
+            var array = new ChessPiece[8, 8];
+            for (int i = 0; i < 8; i++)
+            {
+                for (int j = 0; j < 8; j++)
+                {
+                    var piece = list[i][j];
+                    array[i, j] = (piece.Type == PieceType.None) ? null : piece.Clone();
+                }
+            }
+            return array;
+        }
+
+        private void HandleGameEndFromServer(ChessField serverField)
+        {
+            string message;
+            if (serverField.Winner == null)
+            {
+                message = "Игра завершена ничьей!";
+            }
+            else if (serverField.Winner == myTeam)
+            {
+                message = "Поздравляем! Вы победили!";
+            }
+            else
+            {
+                message = "Вы проиграли. Удачи в следующий раз!";
+            }
+
+            MessageBox.Show(message, "Игра завершена", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            btnSurrender.Enabled = false;
+            btnDrawOffer.Enabled = false;
+        }
+
+        private async Task HandleGameEnd()
+        {
+            try
+            {
+                if (gameState.Winner == myTeam)
+                {
+                    await SendGameResultToServer("win");
+                }
+                else if (gameState.Winner == null)
+                {
+                    await SendGameResultToServer("draw");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error sending game result: {ex.Message}");
+            }
+        }
+
+        private async Task SendGameResultToServer(string result)
+        {
+            try
+            {
+                var gameResult = new
+                {
+                    UserId = playerId,
+                    LobbyId = lobbyId,
+                    Result = result,
+                    ChessField = BuildChessFieldForServer()
+                };
+
+                var json = JsonSerializer.Serialize(gameResult);
+                var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                string endpoint = result == "win" ? "api/Win" : "api/Draw";
+                await httpClient.PostAsync(endpoint, content);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error sending game result to server: {ex.Message}");
+            }
+        }
+
+        private void UpdateGameInfo()
+        {
+            string currentPlayerText = gameState.CurrentPlayer == PlayerTeam.White ? "Белые" : "Черные";
+            lblTurnInfo.Text = $"Ход: {currentPlayerText}";
+
+            if (gameState.IsGameOver)
+            {
+                if (gameState.Winner == null)
+                {
+                    lblStatusInfo.Text = "Игра завершена ничьей";
+                }
+                else
+                {
+                    string winner = gameState.Winner == PlayerTeam.White ? "Белые" : "Черные";
+                    lblStatusInfo.Text = $"Победили {winner}!";
+                }
+                progressBarThinking.Visible = false;
+            }
+            else if (myTurn)
+            {
+                lblStatusInfo.Text = "Ваш ход";
+                progressBarThinking.Visible = false;
+            }
+            else
+            {
+                lblStatusInfo.Text = "Ожидание хода противника...";
+                progressBarThinking.Visible = true;
+            }
+
+            if (gameState.IsInCheck)
+            {
+                lblStatusInfo.Text += " (ШАХ!)";
+            }
+        }
+
+        // Логика валидации ходов
         private List<Point> GetValidMoves(ChessPiece piece)
         {
-            List<Point> moves = new List<Point>();
+            var moves = new List<Point>();
 
             switch (piece.Type)
             {
@@ -431,36 +911,45 @@ namespace ChessClient
                     break;
             }
 
-            return moves.Where(IsValidPosition).ToList();
+            // Фильтрация ходов, оставляющих короля под шахом
+            return moves.Where(move => !WouldLeaveKingInCheck(piece, move)).ToList();
         }
 
         private List<Point> GetPawnMoves(ChessPiece pawn)
         {
-            List<Point> moves = new List<Point>();
+            var moves = new List<Point>();
             int direction = pawn.Team == PlayerTeam.White ? -1 : 1;
             int startRow = pawn.Team == PlayerTeam.White ? 6 : 1;
 
             // Движение вперед
-            if (IsValidPosition(pawn.X + direction, pawn.Y) && board[pawn.X + direction, pawn.Y] == null)
+            int newRow = pawn.X + direction;
+            if (IsValidPosition(newRow, pawn.Y) && gameState.Board[newRow, pawn.Y] == null)
             {
-                moves.Add(new Point(pawn.X + direction, pawn.Y));
+                moves.Add(new Point(newRow, pawn.Y));
 
                 // Двойной ход с начальной позиции
-                if (pawn.X == startRow && board[pawn.X + 2 * direction, pawn.Y] == null)
+                if (pawn.X == startRow)
                 {
-                    moves.Add(new Point(pawn.X + 2 * direction, pawn.Y));
+                    newRow = pawn.X + 2 * direction;
+                    if (IsValidPosition(newRow, pawn.Y) && gameState.Board[newRow, pawn.Y] == null)
+                    {
+                        moves.Add(new Point(newRow, pawn.Y));
+                    }
                 }
             }
 
-            // Взятие по диагонали
-            for (int dy = -1; dy <= 1; dy += 2)
+            // Атака по диагонали
+            for (int colOffset = -1; colOffset <= 1; colOffset += 2)
             {
-                if (IsValidPosition(pawn.X + direction, pawn.Y + dy))
+                int attackRow = pawn.X + direction;
+                int attackCol = pawn.Y + colOffset;
+
+                if (IsValidPosition(attackRow, attackCol))
                 {
-                    ChessPiece target = board[pawn.X + direction, pawn.Y + dy];
+                    ChessPiece target = gameState.Board[attackRow, attackCol];
                     if (target != null && target.Team != pawn.Team)
                     {
-                        moves.Add(new Point(pawn.X + direction, pawn.Y + dy));
+                        moves.Add(new Point(attackRow, attackCol));
                     }
                 }
             }
@@ -470,32 +959,35 @@ namespace ChessClient
 
         private List<Point> GetRookMoves(ChessPiece rook)
         {
-            List<Point> moves = new List<Point>();
+            var moves = new List<Point>();
 
             // Горизонтальные и вертикальные направления
             int[,] directions = { { 0, 1 }, { 0, -1 }, { 1, 0 }, { -1, 0 } };
 
-            for (int i = 0; i < 4; i++)
+            for (int d = 0; d < 4; d++)
             {
-                int dx = directions[i, 0];
-                int dy = directions[i, 1];
+                int rowDir = directions[d, 0];
+                int colDir = directions[d, 1];
 
-                for (int step = 1; step < 8; step++)
+                for (int i = 1; i < 8; i++)
                 {
-                    int newX = rook.X + dx * step;
-                    int newY = rook.Y + dy * step;
+                    int newRow = rook.X + i * rowDir;
+                    int newCol = rook.Y + i * colDir;
 
-                    if (!IsValidPosition(newX, newY)) break;
+                    if (!IsValidPosition(newRow, newCol))
+                        break;
 
-                    ChessPiece target = board[newX, newY];
+                    ChessPiece target = gameState.Board[newRow, newCol];
                     if (target == null)
                     {
-                        moves.Add(new Point(newX, newY));
+                        moves.Add(new Point(newRow, newCol));
                     }
                     else
                     {
                         if (target.Team != rook.Team)
-                            moves.Add(new Point(newX, newY));
+                        {
+                            moves.Add(new Point(newRow, newCol));
+                        }
                         break;
                     }
                 }
@@ -506,20 +998,21 @@ namespace ChessClient
 
         private List<Point> GetKnightMoves(ChessPiece knight)
         {
-            List<Point> moves = new List<Point>();
-            int[,] knightMoves = { { -2, -1 }, { -2, 1 }, { -1, -2 }, { -1, 2 }, { 1, -2 }, { 1, 2 }, { 2, -1 }, { 2, 1 } };
+            var moves = new List<Point>();
+            int[,] knightMoves = { {-2, -1}, {-2, 1}, {-1, -2}, {-1, 2},
+                                  {1, -2}, {1, 2}, {2, -1}, {2, 1} };
 
             for (int i = 0; i < 8; i++)
             {
-                int newX = knight.X + knightMoves[i, 0];
-                int newY = knight.Y + knightMoves[i, 1];
+                int newRow = knight.X + knightMoves[i, 0];
+                int newCol = knight.Y + knightMoves[i, 1];
 
-                if (IsValidPosition(newX, newY))
+                if (IsValidPosition(newRow, newCol))
                 {
-                    ChessPiece target = board[newX, newY];
+                    ChessPiece target = gameState.Board[newRow, newCol];
                     if (target == null || target.Team != knight.Team)
                     {
-                        moves.Add(new Point(newX, newY));
+                        moves.Add(new Point(newRow, newCol));
                     }
                 }
             }
@@ -529,32 +1022,35 @@ namespace ChessClient
 
         private List<Point> GetBishopMoves(ChessPiece bishop)
         {
-            List<Point> moves = new List<Point>();
+            var moves = new List<Point>();
 
             // Диагональные направления
-            int[,] directions = { { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 } };
+            int[,] directions = { { -1, -1 }, { -1, 1 }, { 1, -1 }, { 1, 1 } };
 
-            for (int i = 0; i < 4; i++)
+            for (int d = 0; d < 4; d++)
             {
-                int dx = directions[i, 0];
-                int dy = directions[i, 1];
+                int rowDir = directions[d, 0];
+                int colDir = directions[d, 1];
 
-                for (int step = 1; step < 8; step++)
+                for (int i = 1; i < 8; i++)
                 {
-                    int newX = bishop.X + dx * step;
-                    int newY = bishop.Y + dy * step;
+                    int newRow = bishop.X + i * rowDir;
+                    int newCol = bishop.Y + i * colDir;
 
-                    if (!IsValidPosition(newX, newY)) break;
+                    if (!IsValidPosition(newRow, newCol))
+                        break;
 
-                    ChessPiece target = board[newX, newY];
+                    ChessPiece target = gameState.Board[newRow, newCol];
                     if (target == null)
                     {
-                        moves.Add(new Point(newX, newY));
+                        moves.Add(new Point(newRow, newCol));
                     }
                     else
                     {
                         if (target.Team != bishop.Team)
-                            moves.Add(new Point(newX, newY));
+                        {
+                            moves.Add(new Point(newRow, newCol));
+                        }
                         break;
                     }
                 }
@@ -565,7 +1061,7 @@ namespace ChessClient
 
         private List<Point> GetQueenMoves(ChessPiece queen)
         {
-            List<Point> moves = new List<Point>();
+            var moves = new List<Point>();
             moves.AddRange(GetRookMoves(queen));
             moves.AddRange(GetBishopMoves(queen));
             return moves;
@@ -573,535 +1069,406 @@ namespace ChessClient
 
         private List<Point> GetKingMoves(ChessPiece king)
         {
-            List<Point> moves = new List<Point>();
+            var moves = new List<Point>();
 
-            for (int dx = -1; dx <= 1; dx++)
+            for (int rowOffset = -1; rowOffset <= 1; rowOffset++)
             {
-                for (int dy = -1; dy <= 1; dy++)
+                for (int colOffset = -1; colOffset <= 1; colOffset++)
                 {
-                    if (dx == 0 && dy == 0) continue;
+                    if (rowOffset == 0 && colOffset == 0)
+                        continue;
 
-                    int newX = king.X + dx;
-                    int newY = king.Y + dy;
+                    int newRow = king.X + rowOffset;
+                    int newCol = king.Y + colOffset;
 
-                    if (IsValidPosition(newX, newY))
+                    if (IsValidPosition(newRow, newCol))
                     {
-                        ChessPiece target = board[newX, newY];
+                        ChessPiece target = gameState.Board[newRow, newCol];
                         if (target == null || target.Team != king.Team)
                         {
-                            moves.Add(new Point(newX, newY));
+                            moves.Add(new Point(newRow, newCol));
                         }
                     }
+                }
+            }
+
+            // Рокировка (упрощенная версия)
+            if (!king.HasMoved && !IsInCheck(king.Team))
+            {
+                // Короткая рокировка
+                if (CanCastle(king, true))
+                {
+                    moves.Add(new Point(king.X, king.Y + 2));
+                }
+
+                // Длинная рокировка
+                if (CanCastle(king, false))
+                {
+                    moves.Add(new Point(king.X, king.Y - 2));
                 }
             }
 
             return moves;
         }
 
-        private bool IsValidPosition(int x, int y)
+        private bool CanCastle(ChessPiece king, bool shortCastle)
         {
-            return x >= 0 && x < 8 && y >= 0 && y < 8;
-        }
+            int rookCol = shortCastle ? 7 : 0;
+            int direction = shortCastle ? 1 : -1;
 
-        private bool IsValidPosition(Point position)
-        {
-            return IsValidPosition(position.X, position.Y);
-        }
+            // Проверка ладьи
+            ChessPiece rook = gameState.Board[king.X, rookCol];
+            if (rook == null || rook.Type != PieceType.Rook || rook.HasMoved)
+                return false;
 
-        private bool IsCheckmate(PlayerTeam team)
-        {
-            // Упрощенная проверка на мат - проверяем, есть ли возможные ходы
-            for (int x = 0; x < 8; x++)
+            // Проверка пустых клеток между королем и ладьей
+            int startCol = king.Y + direction;
+            int endCol = shortCastle ? rookCol - 1 : rookCol + 1;
+
+            for (int col = Math.Min(startCol, endCol); col <= Math.Max(startCol, endCol); col++)
             {
-                for (int y = 0; y < 8; y++)
-                {
-                    ChessPiece piece = board[x, y];
-                    if (piece != null && piece.Team == team)
-                    {
-                        if (GetValidMoves(piece).Count > 0)
-                            return false;
-                    }
-                }
+                if (gameState.Board[king.X, col] != null)
+                    return false;
             }
+
+            // Проверка, что король не проходит через атакованные поля
+            for (int col = king.Y; col != king.Y + 2 * direction + direction; col += direction)
+            {
+                if (IsSquareUnderAttack(new Point(king.X, col), GetOppositeTeam(king.Team)))
+                    return false;
+            }
+
             return true;
         }
 
-        private void UpdateGameInfo()
+        private bool IsValidPosition(int row, int col)
         {
-            lblTurnInfo.Text = currentPlayer == PlayerTeam.White ? "Ход белых" : "Ход черных";
-            if (myTurn)
-                lblTurnInfo.Text += " (Ваш ход)";
-            else
-                lblTurnInfo.Text += " (Ход противника)";
+            return row >= 0 && row < 8 && col >= 0 && col < 8;
         }
 
-        private void Square_MouseEnter(object sender, EventArgs e)
+        private bool WouldLeaveKingInCheck(ChessPiece piece, Point move)
         {
-            Button square = sender as Button;
-            Point position = (Point)square.Tag;
-
-            if (selectedPiece != null && validMoves.Contains(position))
-            {
-                square.BackColor = Color.LightBlue;
-            }
-        }
-
-        private void Square_MouseLeave(object sender, EventArgs e)
-        {
-            UpdateBoardDisplay();
-        }
-
-        private async Task Surrender()
-        {
-            try
-            {
-                var field = BuildChessFieldForServer();
-                field.IsGameOver = true;
-                field.Winner = (myTeam == PlayerTeam.White) ? PlayerTeam.Black : PlayerTeam.White;
-
-                var lobby = new Lobby
-                {
-                    id = lobbyId,
-                    chessField = field
-                };
-
-                var json = JsonSerializer.Serialize(new LobbyEntity
-                {
-                    Id = lobby.id,
-                    ChessFieldJson = JsonSerializer.Serialize(field)
-                });
-
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-                await http.PostAsync("api/updateChessField", content);
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("Ошибка при сдаче: " + ex.Message, "Ошибка",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
-
-        private async void BtnSurrender_Click(object sender, EventArgs e)
-        {
-            var result = MessageBox.Show("Вы уверены, что хотите сдаться?", "Сдача",
-                MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-
-            if (result == DialogResult.Yes)
-            {
-                await Surrender();
-
-                MessageBox.Show("Вы сдались. Победа противника!", "Игра окончена",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
-                this.Close();
-            }
-        }
-
-        private async Task UpdateServerChessField()
-        {
-            try
-            {
-                var field = BuildChessFieldForServer();
-                var lobby = new Lobby
-                {
-                    id = lobbyId,
-                    chessField = field
-                };
-
-                var json = JsonSerializer.Serialize(new LobbyEntity
-                {
-                    Id = lobby.id,
-                    ChessFieldJson = JsonSerializer.Serialize(field)
-                });
-
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-                var response = await http.PostAsync("api/updateChessField", content);
-
-                if (!response.IsSuccessStatusCode)
-                {
-                    MessageBox.Show("Ошибка обновления поля на сервере", "Ошибка",
-                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                }
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("Ошибка при отправке на сервер: " + ex.Message, "Ошибка",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
-
-
-        private async Task SendWinToServer()
-        {
-            try
-            {
-                var move = new Move
-                {
-                    UserId = playerId,
-                    chessField = BuildChessFieldForServer()
-                };
-                var content = new StringContent(JsonSerializer.Serialize(move), Encoding.UTF8, "application/json");
-                await http.PostAsync("api/Win", content);
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("Ошибка при отправке победы: " + ex.Message, "Ошибка",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
-
-        private ChessField BuildChessFieldForServer()
-        {
-            var field = new ChessField
-            {
-                Board = new List<List<ChessPiece>>(),
-                CurrentPlayer = (myTeam == PlayerTeam.White) ? PlayerTeam.Black : PlayerTeam.White,
-                IsGameOver = false,
-                Winner = null
-            };
-
-            for (int i = 0; i < 8; i++)
-            {
-                var row = new List<ChessPiece>();
-                for (int j = 0; j < 8; j++)
-                {
-                    var piece = board[i, j];
-                    row.Add(piece ?? new ChessPiece());
-                }
-                field.Board.Add(row);
-            }
-
-            return field;
-        }
-
-        private void StartGamePolling()
-        {
-            pollCts?.Cancel();
-            pollCts = new CancellationTokenSource();
-
-            Task.Run(async () =>
-            {
-                while (!pollCts.Token.IsCancellationRequested)
-                {
-                    try
-                    {
-                        var response = await http.GetAsync($"api/getChessField/{lobbyId}");
-                        if (response.IsSuccessStatusCode)
-                        {
-                            var body = await response.Content.ReadAsStringAsync();
-                            if (!string.IsNullOrWhiteSpace(body) && body != "null")
-                            {
-                                var serverField = JsonSerializer.Deserialize<ChessField>(body);
-                                if (serverField != null)
-                                {
-                                    if (serverField.IsGameOver)
-                                    {
-                                        BeginInvoke(() =>
-                                        {
-                                            string winner = serverField.Winner == myTeam ? "Вы победили!" : "Вы проиграли!";
-                                            ShowGameEndDialog(winner, "Игра окончена");
-                                        });
-                                        return;
-                                    }
-
-                                    if (serverField.CurrentPlayer == myTeam)
-                                    {
-                                        // Наш ход
-                                        if (!BoardsAreEqual(serverField.Board, board))
-                                        {
-                                            BeginInvoke(() =>
-                                            {
-                                                board = ConvertToArray(serverField.Board);
-                                                UpdateBoardDisplay();
-                                                myTurn = true;
-                                                currentPlayer = myTeam;
-                                                UpdateGameInfo();
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Polling error: {ex.Message}");
-                    }
-
-                    await Task.Delay(1000, pollCts.Token);
-                }
-            }, pollCts.Token);
-        }
-
-        private bool BoardsAreEqual(List<List<ChessPiece>> serverBoard, ChessPiece[,] localBoard)
-        {
+            // Создание копии доски для симуляции хода
+            ChessPiece[,] tempBoard = new ChessPiece[8, 8];
             for (int i = 0; i < 8; i++)
             {
                 for (int j = 0; j < 8; j++)
                 {
-                    if (serverBoard[i][j].Type != localBoard[i, j].Type ||
-                        serverBoard[i][j].Team != localBoard[i, j].Team)
-                    {
-                        return false;
-                    }
+                    tempBoard[i, j] = gameState.Board[i, j]?.Clone();
                 }
             }
-            return true;
-        }
 
-        private ChessPiece[,] ConvertToArray(List<List<ChessPiece>> list)
-        {
-            var array = new ChessPiece[8, 8];
-            for (int i = 0; i < 8; i++)
-                for (int j = 0; j < 8; j++)
-                    array[i, j] = list[i][j];
-            return array;
-        }
+            // Выполнение временного хода
+            tempBoard[move.X, move.Y] = tempBoard[piece.X, piece.Y];
+            tempBoard[piece.X, piece.Y] = null;
 
-        protected override void OnFormClosed(FormClosedEventArgs e)
-        {
-            pollCts?.Cancel();
-            http?.Dispose();
-            base.OnFormClosed(e);
+            // Проверка шаха после хода
+            return IsKingInCheck(piece.Team, tempBoard);
         }
-
-        // Дополнительные методы для улучшения функциональности
 
         private bool IsInCheck(PlayerTeam team)
         {
-            // Найти короля команды
-            Point kingPosition = new Point(-1, -1);
-            for (int x = 0; x < 8; x++)
+            return IsKingInCheck(team, gameState.Board);
+        }
+
+        private bool IsKingInCheck(PlayerTeam team, ChessPiece[,] board)
+        {
+            Point kingPos = FindKing(team, board);
+            if (kingPos.X == -1)
+                return false;
+
+            return IsSquareUnderAttack(kingPos, GetOppositeTeam(team), board);
+        }
+
+        private Point FindKing(PlayerTeam team)
+        {
+            return FindKing(team, gameState.Board);
+        }
+
+        private Point FindKing(PlayerTeam team, ChessPiece[,] board)
+        {
+            for (int row = 0; row < 8; row++)
             {
-                for (int y = 0; y < 8; y++)
+                for (int col = 0; col < 8; col++)
                 {
-                    ChessPiece piece = board[x, y];
+                    ChessPiece piece = board[row, col];
                     if (piece != null && piece.Type == PieceType.King && piece.Team == team)
                     {
-                        kingPosition = new Point(x, y);
-                        break;
+                        return new Point(row, col);
                     }
                 }
-                if (kingPosition.X != -1) break;
             }
+            return new Point(-1, -1);
+        }
 
-            if (kingPosition.X == -1) return false; // Король не найден
+        private bool IsSquareUnderAttack(Point square, PlayerTeam attackingTeam)
+        {
+            return IsSquareUnderAttack(square, attackingTeam, gameState.Board);
+        }
 
-            // Проверить, может ли любая фигура противника атаковать короля
-            PlayerTeam opponentTeam = team == PlayerTeam.White ? PlayerTeam.Black : PlayerTeam.White;
-            for (int x = 0; x < 8; x++)
+        private bool IsSquareUnderAttack(Point square, PlayerTeam attackingTeam, ChessPiece[,] board)
+        {
+            for (int row = 0; row < 8; row++)
             {
-                for (int y = 0; y < 8; y++)
+                for (int col = 0; col < 8; col++)
                 {
-                    ChessPiece piece = board[x, y];
-                    if (piece != null && piece.Team == opponentTeam)
+                    ChessPiece piece = board[row, col];
+                    if (piece != null && piece.Team == attackingTeam)
                     {
-                        List<Point> moves = GetValidMoves(piece);
-                        if (moves.Contains(kingPosition))
+                        if (CanPieceAttackSquare(piece, square, board))
                         {
                             return true;
                         }
                     }
                 }
             }
-
             return false;
         }
 
-        private bool IsMoveLegal(ChessPiece piece, Point from, Point to)
+        private bool CanPieceAttackSquare(ChessPiece piece, Point target, ChessPiece[,] board)
         {
-            // Сохранить текущее состояние
-            ChessPiece originalPiece = board[to.X, to.Y];
-            ChessPiece movingPiece = board[from.X, from.Y];
-
-            // Сделать временный ход
-            board[to.X, to.Y] = movingPiece;
-            board[from.X, from.Y] = null;
-
-            // Проверить, остается ли король под шахом
-            bool isLegal = !IsInCheck(piece.Team);
-
-            // Восстановить состояние
-            board[from.X, from.Y] = movingPiece;
-            board[to.X, to.Y] = originalPiece;
-
-            return isLegal;
-        }
-
-        private void HighlightCheck()
-        {
-            // Подсветить короля, если он под шахом
-            if (IsInCheck(myTeam))
+            switch (piece.Type)
             {
-                for (int x = 0; x < 8; x++)
-                {
-                    for (int y = 0; y < 8; y++)
-                    {
-                        ChessPiece piece = board[x, y];
-                        if (piece != null && piece.Type == PieceType.King && piece.Team == myTeam)
-                        {
-                            squares[x, y].BackColor = Color.Red;
-                            return;
-                        }
-                    }
-                }
+                case PieceType.Pawn:
+                    return CanPawnAttack(piece, target);
+                case PieceType.Rook:
+                    return CanRookAttack(piece, target, board);
+                case PieceType.Knight:
+                    return CanKnightAttack(piece, target);
+                case PieceType.Bishop:
+                    return CanBishopAttack(piece, target, board);
+                case PieceType.Queen:
+                    return CanRookAttack(piece, target, board) || CanBishopAttack(piece, target, board);
+                case PieceType.King:
+                    return CanKingAttack(piece, target);
+                default:
+                    return false;
             }
         }
 
-        private bool CanCastle(PlayerTeam team, bool kingSide)
+        private bool CanPawnAttack(ChessPiece pawn, Point target)
         {
-            int row = team == PlayerTeam.White ? 7 : 0;
-            int kingCol = 4;
-            int rookCol = kingSide ? 7 : 0;
+            int direction = pawn.Team == PlayerTeam.White ? -1 : 1;
+            int attackRow = pawn.X + direction;
 
-            // Проверить, что король и ладья не двигались
-            ChessPiece king = board[row, kingCol];
-            ChessPiece rook = board[row, rookCol];
+            return attackRow == target.X && Math.Abs(pawn.Y - target.Y) == 1;
+        }
 
-            if (king == null || king.Type != PieceType.King || king.HasMoved) return false;
-            if (rook == null || rook.Type != PieceType.Rook || rook.HasMoved) return false;
+        private bool CanRookAttack(ChessPiece rook, Point target, ChessPiece[,] board)
+        {
+            if (rook.X != target.X && rook.Y != target.Y)
+                return false;
 
-            // Проверить, что между королем и ладьей нет фигур
-            int start = Math.Min(kingCol, rookCol) + 1;
-            int end = Math.Max(kingCol, rookCol);
-            for (int col = start; col < end; col++)
+            int rowDir = Math.Sign(target.X - rook.X);
+            int colDir = Math.Sign(target.Y - rook.Y);
+
+            int currentRow = rook.X + rowDir;
+            int currentCol = rook.Y + colDir;
+
+            while (currentRow != target.X || currentCol != target.Y)
             {
-                if (board[row, col] != null) return false;
-            }
+                if (board[currentRow, currentCol] != null)
+                    return false;
 
-            // Проверить, что король не под шахом
-            if (IsInCheck(team)) return false;
-
-            // Проверить, что король не пройдет через шах
-            int direction = kingSide ? 1 : -1;
-            for (int i = 1; i <= 2; i++)
-            {
-                int testCol = kingCol + direction * i;
-                board[row, testCol] = king;
-                board[row, kingCol] = null;
-
-                bool inCheck = IsInCheck(team);
-
-                board[row, kingCol] = king;
-                board[row, testCol] = null;
-
-                if (inCheck) return false;
+                currentRow += rowDir;
+                currentCol += colDir;
             }
 
             return true;
         }
 
-        private void PerformCastling(PlayerTeam team, bool kingSide)
+        private bool CanKnightAttack(ChessPiece knight, Point target)
         {
-            int row = team == PlayerTeam.White ? 7 : 0;
-            int kingCol = 4;
-            int rookCol = kingSide ? 7 : 0;
-            int newKingCol = kingSide ? 6 : 2;
-            int newRookCol = kingSide ? 5 : 3;
+            int rowDiff = Math.Abs(knight.X - target.X);
+            int colDiff = Math.Abs(knight.Y - target.Y);
 
-            ChessPiece king = board[row, kingCol];
-            ChessPiece rook = board[row, rookCol];
-
-            // Переместить короля
-            board[row, newKingCol] = king;
-            board[row, kingCol] = null;
-            king.X = row;
-            king.Y = newKingCol;
-            king.HasMoved = true;
-
-            // Переместить ладью
-            board[row, newRookCol] = rook;
-            board[row, rookCol] = null;
-            rook.X = row;
-            rook.Y = newRookCol;
-            rook.HasMoved = true;
+            return (rowDiff == 2 && colDiff == 1) || (rowDiff == 1 && colDiff == 2);
         }
 
-        private List<Point> GetEnPassantMoves(ChessPiece pawn)
+        private bool CanBishopAttack(ChessPiece bishop, Point target, ChessPiece[,] board)
         {
-            List<Point> moves = new List<Point>();
+            int rowDiff = Math.Abs(bishop.X - target.X);
+            int colDiff = Math.Abs(bishop.Y - target.Y);
 
-            if (pawn.Type != PieceType.Pawn) return moves;
+            if (rowDiff != colDiff)
+                return false;
 
-            int direction = pawn.Team == PlayerTeam.White ? -1 : 1;
-            int enPassantRow = pawn.Team == PlayerTeam.White ? 3 : 4;
+            int rowDir = Math.Sign(target.X - bishop.X);
+            int colDir = Math.Sign(target.Y - bishop.Y);
 
-            if (pawn.X != enPassantRow) return moves;
+            int currentRow = bishop.X + rowDir;
+            int currentCol = bishop.Y + colDir;
 
-            // Проверить соседние пешки противника
-            for (int dy = -1; dy <= 1; dy += 2)
+            while (currentRow != target.X || currentCol != target.Y)
             {
-                int checkY = pawn.Y + dy;
-                if (IsValidPosition(pawn.X, checkY))
+                if (board[currentRow, currentCol] != null)
+                    return false;
+
+                currentRow += rowDir;
+                currentCol += colDir;
+            }
+
+            return true;
+        }
+
+        private bool CanKingAttack(ChessPiece king, Point target)
+        {
+            int rowDiff = Math.Abs(king.X - target.X);
+            int colDiff = Math.Abs(king.Y - target.Y);
+
+            return rowDiff <= 1 && colDiff <= 1 && (rowDiff + colDiff > 0);
+        }
+
+        private PlayerTeam GetOppositeTeam(PlayerTeam team)
+        {
+            return team == PlayerTeam.White ? PlayerTeam.Black : PlayerTeam.White;
+        }
+
+        private bool IsCheckmate(PlayerTeam team)
+        {
+            if (!IsInCheck(team))
+                return false;
+
+            return !HasValidMoves(team);
+        }
+
+        private bool IsStalemate(PlayerTeam team)
+        {
+            if (IsInCheck(team))
+                return false;
+
+            return !HasValidMoves(team);
+        }
+
+        private bool HasValidMoves(PlayerTeam team)
+        {
+            for (int row = 0; row < 8; row++)
+            {
+                for (int col = 0; col < 8; col++)
                 {
-                    ChessPiece adjacentPiece = board[pawn.X, checkY];
-                    if (adjacentPiece != null &&
-                        adjacentPiece.Type == PieceType.Pawn &&
-                        adjacentPiece.Team != pawn.Team)
+                    ChessPiece piece = gameState.Board[row, col];
+                    if (piece != null && piece.Team == team)
                     {
-                        // Здесь нужно проверить, что пешка только что сделала двойной ход
-                        // Для упрощения добавим ход взятия на проходе
-                        Point enPassantSquare = new Point(pawn.X + direction, checkY);
-                        if (IsValidPosition(enPassantSquare) && board[enPassantSquare.X, enPassantSquare.Y] == null)
-                        {
-                            moves.Add(enPassantSquare);
-                        }
+                        var moves = GetValidMoves(piece);
+                        if (moves.Count > 0)
+                            return true;
                     }
                 }
             }
-
-            return moves;
+            return false;
         }
 
-        private void ShowGameEndDialog(string message, string title)
+        // Обработчики событий UI
+        private async void BtnSurrender_Click(object sender, EventArgs e)
         {
-            var result = MessageBox.Show(message + "\n\nХотите начать новую игру?", title,
-                MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+            var result = MessageBox.Show("Вы уверены, что хотите сдаться?", "Подтверждение",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question);
 
             if (result == DialogResult.Yes)
             {
-                // Здесь можно добавить логику для начала новой игры
-                InitializeBoard();
-                gameStarted = true;
-                myTurn = (myTeam == PlayerTeam.White);
-                currentPlayer = PlayerTeam.White;
-                UpdateGameInfo();
-            }
-            else
-            {
-                this.Close();
-            }
-        }
-
-        private void SaveGameState()
-        {
-            // Метод для сохранения состояния игры (можно реализовать позже)
-            try
-            {
-                string gameState = JsonSerializer.Serialize(board);
-                // Сохранить в файл или отправить на сервер
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Ошибка сохранения игры: {ex.Message}");
-            }
-        }
-
-        private void LoadGameState(string gameState)
-        {
-            // Метод для загрузки состояния игры
-            try
-            {
-                var loadedBoard = JsonSerializer.Deserialize<ChessPiece[,]>(gameState);
-                if (loadedBoard != null)
+                try
                 {
-                    board = loadedBoard;
-                    UpdateBoardDisplay();
+                    await SendSurrenderToServer();
+                    gameState.IsGameOver = true;
+                    gameState.Winner = GetOppositeTeam(myTeam);
+
+                    MessageBox.Show("Вы сдались.", "Игра завершена",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+
+                    btnSurrender.Enabled = false;
+                    btnDrawOffer.Enabled = false;
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"Ошибка при отправке сдачи: {ex.Message}", "Ошибка",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
             }
-            catch (Exception ex)
+        }
+
+        private async void BtnDrawOffer_Click(object sender, EventArgs e)
+        {
+            var result = MessageBox.Show("Предложить ничью сопернику?", "Предложение ничьи",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+
+            if (result == DialogResult.Yes)
             {
-                Console.WriteLine($"Ошибка загрузки игры: {ex.Message}");
+                try
+                {
+                    await SendDrawOfferToServer();
+                    MessageBox.Show("Предложение ничьи отправлено сопернику.", "Информация",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"Ошибка при отправке предложения ничьи: {ex.Message}", "Ошибка",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
             }
+        }
+
+        private async Task SendSurrenderToServer()
+        {
+            var surrenderData = new
+            {
+                UserId = playerId,
+                LobbyId = lobbyId,
+                ChessField = BuildChessFieldForServer()
+            };
+
+            var json = JsonSerializer.Serialize(surrenderData);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+            var response = await httpClient.PostAsync("api/Surrender", content);
+            response.EnsureSuccessStatusCode();
+        }
+
+        private async Task SendDrawOfferToServer()
+        {
+            var drawData = new
+            {
+                UserId = playerId,
+                LobbyId = lobbyId,
+                ChessField = BuildChessFieldForServer()
+            };
+
+            var json = JsonSerializer.Serialize(drawData);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+            var response = await httpClient.PostAsync("api/OfferDraw", content);
+            response.EnsureSuccessStatusCode();
+        }
+
+        private void Square_MouseEnter(object sender, EventArgs e)
+        {
+            Button square = sender as Button;
+            if (!gameState.IsGameOver && myTurn)
+            {
+                square.Cursor = Cursors.Hand;
+            }
+        }
+
+        private void Square_MouseLeave(object sender, EventArgs e)
+        {
+            Button square = sender as Button;
+            square.Cursor = Cursors.Default;
+        }
+
+        private void ChessGameForm_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            pollingCts?.Cancel();
+            httpClient?.Dispose();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                pollingCts?.Cancel();
+                pollingCts?.Dispose();
+                httpClient?.Dispose();
+            }
+            base.Dispose(disposing);
         }
     }
 }

@@ -457,17 +457,7 @@ namespace ChessClient
 
                 var json = await resp.Content.ReadAsStringAsync();
                 var lobbyEntities = JsonSerializer.Deserialize<List<LobbyEntity>>(json) ?? new List<LobbyEntity>();
-                lobbies = lobbyEntities.Select(e => new Lobby
-                {
-                    id = e.Id,
-                    name = e.Name,
-                    isPassword = e.IsPassword,
-                    password = e.Password,
-                    hostID = e.HostID,
-                    usersID = e.UsersID,
-                    final = e.Final,
-                    chessField = null
-                }).ToList();
+                lobbies = JsonSerializer.Deserialize<List<Lobby>>(json) ?? new List<Lobby>();
                 // Принудительное обновление DataGridView
                 dataGridView1.SuspendLayout();
                 dataGridView1.DataSource = null;
@@ -531,7 +521,8 @@ namespace ChessClient
                 var idStr = await resp.Content.ReadAsStringAsync();
                 currentLobbyId = int.Parse(idStr);
                 isHost = true;
-                await ConnectToOwnLobbyAsHost(currentLobbyId);
+                await RefreshLobbies();
+                //await ConnectToOwnLobbyAsHost(currentLobbyId);
                 HideCreateLobbyControls();
                 txtLobbyName.Clear();
                 txtPassword.Clear();
@@ -551,7 +542,7 @@ namespace ChessClient
             }
         }
 
-        private async Task ConnectToOwnLobbyAsHost(int lobbyId)
+        /*private async Task ConnectToOwnLobbyAsHost(int lobbyId)
         {
             try
             {
@@ -564,7 +555,7 @@ namespace ChessClient
             {
                 MessageBox.Show("Ошибка автоподключения хоста: " + ex.Message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
-        }
+        }*/
 
         private void btnCancelCreate_Click(object sender, EventArgs e)
         {
@@ -590,10 +581,10 @@ namespace ChessClient
                 MessageBox.Show("Невозможно подключиться", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
-
+            var enteredPassword = string.Empty;
             if (sel.isPassword && !string.IsNullOrEmpty(sel.password))
             {
-                var enteredPassword = ShowPasswordDialog();
+                enteredPassword = ShowPasswordDialog();
                 if (string.IsNullOrEmpty(enteredPassword) || enteredPassword != sel.password)
                 {
                     MessageBox.Show("Неверный пароль или отмена ввода", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -670,7 +661,7 @@ namespace ChessClient
 
                 if (selectedLobby == null)
                 {
-                    MessageBox.Show("Лобби не найдено!", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show($"Лобби не найдено! {selectedLobby} {currentLobbyId}", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
 
