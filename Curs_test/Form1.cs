@@ -8,13 +8,13 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using static System.Windows.Forms.Design.AxImporter;
 
 namespace ChessClient
 {
-    using System.Net.Http;
-    using System.Text;
-    using System.Text.Json;
-
     public class ChessClientApi
     {
         private readonly HttpClient _httpClient;
@@ -176,6 +176,8 @@ namespace ChessClient
         private readonly int lobbyId;
         private readonly PlayerTeam myTeam;
         private GameState gameState;
+        private ChessPiece selectedPiece = null;
+        private List<Point> validMoves = new List<Point>();
 
         // UI элементы
         private Panel boardPanel;
@@ -190,8 +192,6 @@ namespace ChessClient
 
         // Игровая логика
         private Point selectedSquare = new Point(-1, -1);
-        private ChessPiece selectedPiece;
-        private List<Point> validMoves = new List<Point>();
         private bool myTurn = false;
         private CancellationTokenSource pollingCts;
 
@@ -541,7 +541,11 @@ namespace ChessClient
 
         private string GetPieceSymbol(ChessPiece piece)
         {
-            return piece.Team switch
+            string[] whiteSymbols = { "", "♙", "♖", "♘", "♗", "♕", "♔" };
+            string[] blackSymbols = { "", "♟", "♜", "♞", "♝", "♛", "♚" };
+
+            return piece.Team == PlayerTeam.White ? whiteSymbols[(int)piece.Type] : blackSymbols[(int)piece.Type];
+            /*return piece.Team switch
             {
                 PlayerTeam.White => piece.Type switch
                 {
@@ -564,57 +568,125 @@ namespace ChessClient
                     _ => ""
                 },
                 _ => ""
-            };
+            };*/
         }
 
         private async void Square_Click(object sender, EventArgs e)
         {
-            if (!myTurn || gameState.IsGameOver)
+            if (gameState.IsGameOver || !myTurn)
                 return;
 
-            Button btn = sender as Button;
-            Point coords = (Point)btn.Tag;
-            int row = coords.X;
-            int col = coords.Y;
+            Button clickedSquare = sender as Button;
+            Point squarePos = GetSquarePosition(clickedSquare);
 
-            var clickedPiece = gameState.Board[row, col];
+            ChessPiece piece = gameState.Board[squarePos.X, squarePos.Y];
 
             if (selectedPiece == null)
             {
-                // Выбор своей фигуры
-                if (clickedPiece != null && clickedPiece.Team == myTeam)
+                // Выбираем фигуру, если она принадлежит текущему игроку
+                if (piece != null && piece.Team == myTeam)
                 {
-                    selectedPiece = clickedPiece;
-                    HighlightValidMoves(selectedPiece);
+                    selectedPiece = piece;
+                    validMoves = GetValidMoves(piece);
+                    HighlightSquares(validMoves);
                 }
             }
             else
             {
-                // Попытка хода
-                var move = new Point(row, col);
-                var validMoves = GetValidMoves(selectedPiece);
-
-                if (validMoves.Any(m => m.X == move.X && m.Y == move.Y))
+                // Если нажали на допустимую клетку, делаем ход
+                if (validMoves.Any(m => m.X == squarePos.X && m.Y == squarePos.Y))
                 {
-                    // Перемещаем фигуру
-                    gameState.Board[selectedPiece.X, selectedPiece.Y] = null;
-                    selectedPiece.X = move.X;
-                    selectedPiece.Y = move.Y;
-                    gameState.Board[move.X, move.Y] = selectedPiece;
+                    MakeMove(selectedPiece, squarePos);
+                    ClearHighlights();
 
+                    selectedPiece = null;
+                    validMoves = null;
+
+                    // Отправляем обновленную доску на сервер
+                    await SendBoardUpdateToServer();
+
+                    // Обновляем состояние игры — например меняем ход
                     myTurn = false;
 
-                    UpdateGameInfo();
-                    RenderBoard();
-
-                    // Сохраняем ход на сервер
-                    await SendBoardUpdateToServer();
+                    // Обновить UI
+                    UpdateBoardUI();
                 }
-
-                selectedPiece = null;
-                ClearHighlights();
+                else
+                {
+                    // Сброс выбора, если кликнули не по валидной клетке
+                    ClearHighlights();
+                    selectedPiece = null;
+                    validMoves = null;
+                }
             }
         }
+
+        private Point GetSquarePosition(Button square)
+        {
+            // Получить координаты клетки по имени или Tag
+            // Например, используем Tag:
+            return (Point)square.Tag;
+        }
+
+        private async void MovePiece(ChessPiece piece, Point destination)
+        {
+            // Обновление позиции фигуры
+            gameState.Board[piece.X, piece.Y] = null;
+            piece.X = destination.X;
+            piece.Y = destination.Y;
+            gameState.Board[destination.X, destination.Y] = piece;
+            piece.HasMoved = true;
+
+            // Обновление состояния
+            myTurn = false;
+            gameState.CurrentPlayer = GetOppositeTeam(myTeam);
+            gameState.IsInCheck = IsInCheck(gameState.CurrentPlayer);
+
+            if (IsCheckmate(gameState.CurrentPlayer))
+            {
+                gameState.IsGameOver = true;
+                gameState.Winner = myTeam;
+            }
+            else if (IsStalemate(gameState.CurrentPlayer))
+            {
+                gameState.IsGameOver = true;
+                gameState.Winner = null;
+            }
+
+            UpdateGameInfo();
+
+            try
+            {
+                await SendBoardUpdateToServer();
+
+                if (gameState.IsGameOver)
+                {
+                    await HandleGameEnd();
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Ошибка при отправке хода: {ex.Message}", "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void HighlightSquares(List<Point> squares)
+        {
+            // Подсвечиваем клетки, куда можно ходить
+            foreach (var p in squares)
+            {
+                Button sq = GetButtonByPosition(p);
+                sq.BackColor = Color.LightGreen; // или любой цвет
+            }
+        }
+
+        private Button GetSquareButton(Point point)
+        {
+            // Реализуй доступ к нужной кнопке на форме по координатам
+            return squares[point.X, point.Y]; // или аналогично, в зависимости от твоей структуры
+        }
+
+
         private List<List<ChessPiece>> ConvertToList(ChessPiece[,] array)
         {
             var list = new List<List<ChessPiece>>();
@@ -654,12 +726,10 @@ namespace ChessClient
 
         private void ClearHighlights()
         {
-            for (int i = 0; i < 8; i++)
+            // Убрать подсветку со всех клеток
+            foreach (var btn in allSquaresButtons)
             {
-                for (int j = 0; j < 8; j++)
-                {
-                    squares[i, j].BackColor = (i + j) % 2 == 0 ? Color.Beige : Color.Brown;
-                }
+                btn.BackColor = DefaultSquareColor(btn);
             }
         }
 
@@ -698,6 +768,17 @@ namespace ChessClient
             selectedPiece = null;
             validMoves.Clear();
             UpdateBoardDisplay();
+        }
+
+        private void MakeMove(ChessPiece piece, Point destination)
+        {
+            // Обновляем игровое состояние
+            gameState.Board[piece.X, piece.Y] = null;
+
+            piece.X = destination.X;
+            piece.Y = destination.Y;
+
+            gameState.Board[destination.X, destination.Y] = piece;
         }
 
         private async Task MakeMove(Point from, Point to)
@@ -984,9 +1065,7 @@ namespace ChessClient
                 var gameResult = new
                 {
                     UserId = playerId,
-                    LobbyId = lobbyId,
-                    Result = result,
-                    ChessField = BuildChessFieldForServer()
+                    LobbyId = lobbyId
                 };
 
                 var json = JsonSerializer.Serialize(gameResult);
