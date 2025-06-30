@@ -14,7 +14,7 @@ namespace Curs_test
             // see https://aka.ms/applicationconfiguration.
             ApplicationConfiguration.Initialize();
             // var a = new ChessClient.Form1(1, 10, PlayerTeam.Black); var b = new ChessClient.Form1(0, 10, PlayerTeam.White);
-            Application.Run(new ChessClient.Form2());
+            Application.Run(new Form3());
             /*new Thread(() =>
             {
                 Application.Run(b);

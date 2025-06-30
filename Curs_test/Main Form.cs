@@ -671,10 +671,11 @@ namespace ChessClient
                 this.Hide();
 
                 // Создаем форму игры
-                Form1 gameForm = new Form1(playerId, currentLobbyId, playerTeam);
+                Form1 gameForm1 = new Form1(playerId, currentLobbyId, playerTeam);
+                Form3 gameForm = new Form3();
 
                 // Обработчик закрытия формы игры
-                gameForm.FormClosed += async (s, e) => {
+                gameForm1.FormClosed += async (s, e) => {
                     if (isHost)
                     {
                         await DeleteLobby(currentLobbyId);
@@ -685,7 +686,7 @@ namespace ChessClient
                 };
 
                 // Показываем форму игры модально
-                gameForm.ShowDialog();
+                gameForm.Show();
             }
             catch (Exception ex)
             {
